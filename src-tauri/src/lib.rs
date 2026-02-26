@@ -613,6 +613,81 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Forward a file drop from Explorer into the webview by injecting JS that
+/// constructs File objects and dispatches dragenter/dragover/drop events.
+/// Limited to 20 MB per file to stay within reasonable JS string sizes.
+#[cfg(target_os = "windows")]
+fn forward_file_drop(
+    window: &tauri::WebviewWindow,
+    paths: &[std::path::PathBuf],
+    position: &tauri::PhysicalPosition<f64>,
+) {
+    use base64::Engine;
+
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let lx = position.x / scale;
+    let ly = position.y / scale;
+
+    const MAX_BYTES: u64 = 20 * 1024 * 1024;
+    let mut files_js = String::new();
+    for path in paths {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if path.metadata().map(|m| m.len()).unwrap_or(0) > MAX_BYTES {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let mime = mime_for_ext(path.extension().and_then(|e| e.to_str()).unwrap_or(""));
+        let name_js = name.replace('\\', "\\\\").replace('"', "\\\"");
+        if !files_js.is_empty() {
+            files_js.push(',');
+        }
+        files_js.push_str(&format!(
+            r#"(()=>{{const s=atob("{b64}");const a=new Uint8Array(s.length);for(let i=0;i<s.length;i++)a[i]=s.charCodeAt(i);return new File([a],"{name_js}",{{type:"{mime}"}})}})()"#,
+            b64 = b64,
+            name_js = name_js,
+            mime = mime
+        ));
+    }
+    if files_js.is_empty() {
+        return;
+    }
+
+    let script = format!(
+        r#"(()=>{{
+            const files=[{files_js}];
+            const dt=new DataTransfer();
+            files.forEach(f=>dt.items.add(f));
+            const el=document.elementFromPoint({lx},{ly})||document.body;
+            for(const t of['dragenter','dragover','drop']){{
+                el.dispatchEvent(new DragEvent(t,{{bubbles:true,cancelable:true,dataTransfer:dt}}));
+            }}
+        }})();"#,
+        files_js = files_js,
+        lx = lx,
+        ly = ly
+    );
+    let _ = window.eval(&script);
+}
+
+#[cfg(target_os = "windows")]
+fn mime_for_ext(ext: &str) -> &'static str {
+    match &ext.to_lowercase()[..] {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
 fn get_server_url_from_store(app: &tauri::AppHandle) -> Option<String> {
     app.store("config.json")
         .ok()
@@ -650,7 +725,6 @@ fn create_main_window(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>
             .inner_size(1024.0, 768.0)
             .min_inner_size(400.0, 300.0)
             .zoom_hotkeys_enabled(true)
-            .disable_drag_drop_handler()
             .on_document_title_changed(|window, title| {
                 let _ = window.set_title(&title);
             })
@@ -789,12 +863,19 @@ pub fn run() {
             Ok(())
         });
 
-    // Close-to-tray on desktop only
+    // Close-to-tray on desktop only; Windows file-drop forwarding
     #[cfg(desktop)]
     let builder = builder.on_window_event(|window, event| {
-        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-            let _ = window.hide();
-            api.prevent_close();
+        match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                let _ = window.hide();
+                api.prevent_close();
+            }
+            #[cfg(target_os = "windows")]
+            tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position }) => {
+                forward_file_drop(window, paths, position);
+            }
+            _ => {}
         }
     });
 
