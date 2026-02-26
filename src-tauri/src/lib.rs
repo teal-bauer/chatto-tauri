@@ -628,20 +628,16 @@ fn forward_file_drop(
     let lx = position.x / scale;
     let ly = position.y / scale;
 
-    const MAX_BYTES: u64 = 20 * 1024 * 1024;
     let mut files_js = String::new();
     for path in paths {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if path.metadata().map(|m| m.len()).unwrap_or(0) > MAX_BYTES {
-            continue;
-        }
         let Ok(bytes) = std::fs::read(path) else {
             continue;
         };
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        let mime = mime_for_ext(path.extension().and_then(|e| e.to_str()).unwrap_or(""));
+        let mime = mime_guess::from_path(path).first_or_octet_stream().to_string();
         let name_js = name.replace('\\', "\\\\").replace('"', "\\\"");
         if !files_js.is_empty() {
             files_js.push(',');
@@ -672,20 +668,6 @@ fn forward_file_drop(
         ly = ly
     );
     let _ = window.eval(&script);
-}
-
-#[cfg(target_os = "windows")]
-fn mime_for_ext(ext: &str) -> &'static str {
-    match &ext.to_lowercase()[..] {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "svg" => "image/svg+xml",
-        "pdf" => "application/pdf",
-        "txt" => "text/plain",
-        _ => "application/octet-stream",
-    }
 }
 
 fn get_server_url_from_store(app: &tauri::AppHandle) -> Option<String> {
