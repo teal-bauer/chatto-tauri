@@ -95,8 +95,76 @@ jobs:
           name: chatto-${{ matrix.label }}
           path: src-tauri/target/**/release/bundle/**
 
+  build-android:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: pnpm
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: sdkmanager "ndk;28.0.13004108"
+
+      - name: Install Rust stable with Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install frontend dependencies
+        run: pnpm install
+
+      - name: Build Android APK
+        run: pnpm tauri android build --apk
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.0.13004108
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatto-android
+          path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+
+      - name: Upload APK to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          apk=$(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' -not -name '*debug*' | head -1)
+          if [ -z "$apk" ]; then
+            apk=$(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' | head -1)
+          fi
+          release_id=$(gh api repos/${{ github.repository }}/releases \
+            --jq '[.[] | select(.draft)] | first | .id')
+          gh release upload "$(gh api repos/${{ github.repository }}/releases/$release_id --jq .tag_name)" \
+            "$apk#Chatto.apk" --clobber
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   release-notes:
-    needs: build
+    needs: [build, build-android]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
