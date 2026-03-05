@@ -2,7 +2,7 @@
 name = "chatto-tauri"
 version = "0.4.2"
 description = "Tauri wrapper for Chatto"
-authors = ["teal"]
+authors = ["Teal Bauer <opensource@teal.is>"]
 license = "AGPL-3.0-or-later"
 edition = "2021"
 
