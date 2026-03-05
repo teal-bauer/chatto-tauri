@@ -139,9 +139,21 @@ jobs:
         run: pnpm install
 
       - name: Build Android APK
-        run: pnpm tauri android build --apk --debug
+        run: pnpm tauri android build --apk
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.0.13004108
+
+      - name: Sign APK
+        run: |
+          apk=$(find src-tauri/gen/android/app/build/outputs/apk -name '*-unsigned.apk' | head -1)
+          keytool -genkeypair -v -keystore release.keystore -alias release \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android \
+            -dname "CN=Chatto, O=Chatto"
+          "${ANDROID_HOME}/build-tools/$(ls ${ANDROID_HOME}/build-tools/ | tail -1)/apksigner" sign \
+            --ks release.keystore --ks-key-alias release \
+            --ks-pass pass:android --key-pass pass:android \
+            "$apk"
 
       - name: Get version
         id: version
