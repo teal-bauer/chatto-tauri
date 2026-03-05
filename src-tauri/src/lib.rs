@@ -378,10 +378,11 @@ fn setup_app_menu(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(not(target_os = "macos"))]
     let app_submenu = {
+        let github = MenuItem::with_id(app, "menu_github", "GitHub…", true, None::<&str>)?;
         let sep2 = PredefinedMenuItem::separator(app)?;
         Submenu::with_items(
             app, "Chatto", true,
-            &[&about, &sep, &check_updates, &sep_updates, &settings, &sep2, &quit],
+            &[&about, &github, &sep, &check_updates, &sep_updates, &settings, &sep2, &quit],
         )?
     };
 
@@ -443,6 +444,10 @@ fn setup_app_menu(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         }
         "menu_settings" => {
             navigate_to_settings(app);
+        }
+        "menu_github" => {
+            use tauri_plugin_opener::OpenerExt;
+            let _ = app.opener().open_url("https://github.com/teal-bauer/chatto-tauri", None::<&str>);
         }
         "menu_back" => {
             if let Some(window) = app.get_webview_window("main") {
