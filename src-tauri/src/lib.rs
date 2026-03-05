@@ -211,7 +211,7 @@ fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
         let base = "tauri://localhost";
         format!("{base}/?settings")
             .parse()
-            .map_err(|e: tauri::url::ParseError| e.to_string())?
+            .map_err(|e| e.to_string())?
     };
 
     window.navigate(url).map_err(|e| e.to_string())
