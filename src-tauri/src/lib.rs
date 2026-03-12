@@ -17,6 +17,19 @@ const NOTIFICATION_BRIDGE_JS: &str = r#"
     if (window.__chattoNotificationBridged) return;
     window.__chattoNotificationBridged = true;
 
+    // Always appear as a background tab so the web app sends notifications
+    // regardless of whether the Chatto window is currently visible or focused.
+    try {
+        Object.defineProperty(document, 'visibilityState', {
+            get: function() { return 'hidden'; },
+            configurable: true,
+        });
+        Object.defineProperty(document, 'hidden', {
+            get: function() { return true; },
+            configurable: true,
+        });
+    } catch(e) {}
+
     window.Notification = function(title, options) {
         if (window.__TAURI_INTERNALS__) {
             window.__TAURI_INTERNALS__.invoke('show_notification', {
@@ -862,6 +875,20 @@ pub fn run() {
     });
 
     builder
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // On macOS, re-show the main window when the app is re-activated
+            // (dock icon clicked, or brought to front after a notification click).
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
+                if !has_visible_windows {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+            }
+            let _ = (app, event);
+        });
 }
