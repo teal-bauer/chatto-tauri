@@ -4,6 +4,9 @@
   "description": "Capabilities for the mobile app",
   "platforms": ["android", "iOS"],
   "windows": ["main"],
+  "remote": {
+    "urls": ["https://*/*", "http://*/*"]
+  },
   "permissions": [
     "core:default",
     "opener:default",

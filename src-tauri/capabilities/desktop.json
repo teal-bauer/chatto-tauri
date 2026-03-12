@@ -4,6 +4,9 @@
   "description": "Capabilities for the desktop app",
   "platforms": ["linux", "macOS", "windows"],
   "windows": ["main"],
+  "remote": {
+    "urls": ["https://*/*", "http://*/*"]
+  },
   "permissions": [
     "core:default",
     "opener:default",

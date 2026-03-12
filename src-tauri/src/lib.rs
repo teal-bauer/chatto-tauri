@@ -17,47 +17,47 @@ const NOTIFICATION_BRIDGE_JS: &str = r#"
     if (window.__chattoNotificationBridged) return;
     window.__chattoNotificationBridged = true;
 
-    // When the Chatto window is hidden in the tray the webview is still alive
-    // but the real visibilityState becomes 'visible' (the webview doesn't
-    // track native window visibility). We override the Page Visibility API
-    // dynamically: force 'hidden' only while the native window is hidden so
-    // the web app sends notifications then, but restore normal behaviour when
-    // the window is shown so presence ("ONLINE/AWAY") works correctly.
+    // Override the Page Visibility API so the web app reports the correct
+    // presence state. window.__chattoWindowHidden is set by Rust via
+    // window.eval() on every WindowEvent::Focused change.
     try {
-        var __chattoWindowHidden = false;
         Object.defineProperty(document, 'visibilityState', {
-            get: function() { return __chattoWindowHidden ? 'hidden' : document.__realVisibilityState; },
+            get: function() { return window.__chattoWindowHidden ? 'hidden' : 'visible'; },
             configurable: true,
         });
         Object.defineProperty(document, 'hidden', {
-            get: function() { return __chattoWindowHidden ? true : document.__realHidden; },
+            get: function() { return !!window.__chattoWindowHidden; },
             configurable: true,
-        });
-        // Stash the real values under non-standard names.
-        Object.defineProperty(document, '__realVisibilityState', {
-            get: function() { return 'visible'; },
-            configurable: true,
-            writable: true,
-        });
-        Object.defineProperty(document, '__realHidden', {
-            get: function() { return false; },
-            configurable: true,
-            writable: true,
         });
     } catch(e) {}
 
-    // Listen for Tauri events that track whether the native window is hidden.
-    if (window.__TAURI_INTERNALS__) {
-        window.__TAURI_INTERNALS__.listen('chatto:window-hidden', function() {
-            window.__chattoWindowHidden = true;
-            document.dispatchEvent(new Event('visibilitychange'));
-        });
-        window.__TAURI_INTERNALS__.listen('chatto:window-shown', function() {
-            window.__chattoWindowHidden = false;
-            document.dispatchEvent(new Event('visibilitychange'));
-        });
-    }
+    // Intercept navigator.setAppBadge to fire native desktop notifications.
+    // Chatto calls setAppBadge with the unread count when messages arrive
+    // while the window is not focused; it never calls new Notification().
+    var _prevBadgeCount = 0;
+    var _origSetAppBadge = navigator.setAppBadge ? navigator.setAppBadge.bind(navigator) : null;
+    var _origClearAppBadge = navigator.clearAppBadge ? navigator.clearAppBadge.bind(navigator) : null;
 
+    navigator.setAppBadge = function(count) {
+        var newCount = typeof count === 'number' ? Math.max(0, Math.floor(count)) : 0;
+        if (newCount > _prevBadgeCount && window.__chattoWindowHidden && window.__TAURI_INTERNALS__) {
+            var diff = newCount - _prevBadgeCount;
+            window.__TAURI_INTERNALS__.invoke('show_notification', {
+                title: 'Chatto',
+                body: diff === 1 ? 'New message' : diff + ' new messages'
+            }).catch(function() {});
+        }
+        _prevBadgeCount = newCount;
+        return _origSetAppBadge ? _origSetAppBadge(count) : undefined;
+    };
+
+    navigator.clearAppBadge = function() {
+        _prevBadgeCount = 0;
+        return _origClearAppBadge ? _origClearAppBadge() : undefined;
+    };
+
+    // Keep Notification API mock for compatibility — reported as granted so
+    // the web app does not prompt the user for permission.
     window.Notification = function(title, options) {
         if (window.__TAURI_INTERNALS__) {
             window.__TAURI_INTERNALS__.invoke('show_notification', {
@@ -429,7 +429,6 @@ fn navigate_to_settings(app: &tauri::AppHandle) {
         let _ = window.navigate(frontend_url("/?settings"));
         let _ = window.show();
         let _ = window.set_focus();
-        let _ = window.emit("chatto:window-shown", ());
     }
 }
 
@@ -438,12 +437,10 @@ fn toggle_window_visibility(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         if window.is_visible().unwrap_or(false) {
             let _ = window.hide();
-            let _ = window.emit("chatto:window-hidden", ());
         } else {
             let _ = window.unminimize();
             let _ = window.show();
             let _ = window.set_focus();
-            let _ = window.emit("chatto:window-shown", ());
         }
     }
 }
@@ -661,7 +658,7 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 /// constructs File objects and dispatches dragenter/dragover/drop events.
 #[cfg(target_os = "windows")]
 fn forward_file_drop(
-    window: &tauri::WebviewWindow,
+    window: &tauri::Window,
     paths: &[std::path::PathBuf],
     position: &tauri::PhysicalPosition<f64>,
 ) {
@@ -710,7 +707,9 @@ fn forward_file_drop(
         lx = lx,
         ly = ly
     );
-    let _ = window.eval(&script);
+    if let Some(wv) = window.app_handle().get_webview_window(window.label()) {
+        let _ = wv.eval(&script);
+    }
 }
 
 fn get_server_url_from_store(app: &tauri::AppHandle) -> Option<String> {
@@ -753,22 +752,13 @@ fn create_main_window(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>
             .on_document_title_changed(|window, title| {
                 let _ = window.set_title(&title);
             })
-            .on_navigation(move |url| {
-                let navigating_host = url.host_str().unwrap_or_default();
-                if url.scheme() == "tauri"
-                    || url.scheme() == "about"
-                    || navigating_host == "localhost"
-                    || navigating_host == "tauri.localhost"
-                    || server_host_clone
-                        .as_ref()
-                        .map(|h| navigating_host == h.as_str())
-                        .unwrap_or(false)
-                {
-                    return true;
-                }
-                use tauri_plugin_opener::OpenerExt;
-                let _ = app_handle.opener().open_url(url.as_str(), None::<&str>);
-                false
+            .on_navigation(move |_url| {
+                // Allow all navigations — EXTERNAL_LINK_JS handles opening
+                // external links in the system browser for user-initiated clicks.
+                // Intercepting here breaks iframe embeds (YouTube, etc.) because
+                // on_navigation fires for subframe loads too.
+                let _ = (&server_host_clone, &app_handle); // suppress unused warnings
+                true
             })
     };
 
@@ -894,8 +884,17 @@ pub fn run() {
         match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {
                 let _ = window.hide();
-                let _ = window.emit("chatto:window-hidden", ());
                 api.prevent_close();
+            }
+            tauri::WindowEvent::Focused(focused) => {
+                let js = if *focused {
+                    "window.__chattoWindowHidden=false;document.dispatchEvent(new Event('visibilitychange'));"
+                } else {
+                    "window.__chattoWindowHidden=true;document.dispatchEvent(new Event('visibilitychange'));"
+                };
+                if let Some(wv) = window.app_handle().get_webview_window(window.label()) {
+                    let _ = wv.eval(js);
+                }
             }
             #[cfg(target_os = "windows")]
             tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position }) => {
@@ -917,7 +916,6 @@ pub fn run() {
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.show();
                         let _ = window.set_focus();
-                        let _ = window.emit("chatto:window-shown", ());
                     }
                 }
             }
