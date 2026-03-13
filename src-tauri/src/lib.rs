@@ -31,30 +31,91 @@ const NOTIFICATION_BRIDGE_JS: &str = r#"
         });
     } catch(e) {}
 
-    // Intercept navigator.setAppBadge to fire native desktop notifications.
-    // Chatto calls setAppBadge with the unread count when messages arrive
-    // while the window is not focused; it never calls new Notification().
-    var _prevBadgeCount = 0;
-    var _origSetAppBadge = navigator.setAppBadge ? navigator.setAppBadge.bind(navigator) : null;
-    var _origClearAppBadge = navigator.clearAppBadge ? navigator.clearAppBadge.bind(navigator) : null;
+    // Deduplication: track recently fired notifications by key (roomId or notificationId)
+    // to avoid firing twice when multiple WebSocket connections deliver the same event.
+    var __chattoRecentNotifKeys = {};
+    function __chattoShouldFire(key) {
+        var now = Date.now();
+        if (__chattoRecentNotifKeys[key] && now - __chattoRecentNotifKeys[key] < 3000) return false;
+        __chattoRecentNotifKeys[key] = now;
+        return true;
+    }
 
-    navigator.setAppBadge = function(count) {
-        var newCount = typeof count === 'number' ? Math.max(0, Math.floor(count)) : 0;
-        if (newCount > _prevBadgeCount && window.__chattoWindowHidden && window.__TAURI_INTERNALS__) {
-            var diff = newCount - _prevBadgeCount;
+    // Fetch the latest room event and show a native notification with the
+    // actual message body. The /api/graphql endpoint is same-origin so the
+    // request carries the user's session cookies automatically.
+    // NotificationCreatedEvent provides spaceId+roomId; DMs use spaceId="DM".
+    function __chattoFetchRoomAndNotify(spaceId, roomId) {
+        if (!window.__TAURI_INTERNALS__) return;
+        if (!__chattoShouldFire(roomId)) return;
+        fetch('/api/graphql', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                query: 'query($s:ID!,$r:ID!){roomEvents(spaceId:$s,roomId:$r,limit:1){actor{displayName}event{__typename...on MessagePostedEvent{body}}}}',
+                variables: {s: spaceId, r: roomId}
+            })
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            var events = data && data.data && data.data.roomEvents;
+            if (!events || !events.length) return;
+            var ev = events[0];
+            var actor = ev.actor && ev.actor.displayName;
+            var body = ev.event && ev.event.body;
+            if (!body) return; // not a message event (e.g. join/leave)
             window.__TAURI_INTERNALS__.invoke('show_notification', {
-                title: 'Chatto',
-                body: diff === 1 ? 'New message' : diff + ' new messages'
+                title: actor || 'Chatto',
+                body: body
             }).catch(function() {});
-        }
-        _prevBadgeCount = newCount;
-        return _origSetAppBadge ? _origSetAppBadge(count) : undefined;
-    };
+        })
+        .catch(function() {});
+    }
 
-    navigator.clearAppBadge = function() {
-        _prevBadgeCount = 0;
-        return _origClearAppBadge ? _origClearAppBadge() : undefined;
-    };
+    // Intercept the WebSocket constructor to read the graphql-ws subscription
+    // stream. Chatto uses wss://<host>/api/graphql with the graphql-ws protocol.
+    // Messages arrive as: {"type":"next","payload":{"data":{"myInstanceEvents":{…}}}}
+    (function() {
+        var _WS = window.WebSocket;
+        function PatchedWebSocket(url, protocols) {
+            var ws = protocols !== undefined ? new _WS(url, protocols) : new _WS(url);
+            if (typeof url === 'string' && url.indexOf('/api/graphql') !== -1) {
+                ws.addEventListener('message', function(ev) {
+                    try {
+                        var msg = JSON.parse(ev.data);
+                        if (msg.type !== 'next') return;
+                        var events = msg.payload && msg.payload.data && msg.payload.data.myInstanceEvents;
+                        if (!events || !events.event) return;
+                        var e = events.event;
+                        var type = e.__typename;
+                        if (!window.__chattoWindowHidden) return;
+                        if (type === 'NotificationCreatedEvent' && e.roomId) {
+                            // spaceId is "DM" for direct messages, a real ID for space rooms
+                            __chattoFetchRoomAndNotify(e.spaceId || 'DM', e.roomId);
+                        } else if (type === 'MentionNotificationEvent') {
+                            // Mentions fire alongside NotificationCreatedEvent; let that handle it
+                            // to avoid duplicates. Keep this as fallback if spaceId is missing.
+                            if (!e.spaceId && window.__TAURI_INTERNALS__) {
+                                window.__TAURI_INTERNALS__.invoke('show_notification', {
+                                    title: (e.space && e.space.name) || 'Chatto',
+                                    body: (e.mentionedBy && e.mentionedBy.displayName || 'Someone')
+                                        + ' mentioned you in #'
+                                        + (e.room && e.room.name || 'a room')
+                                }).catch(function() {});
+                            }
+                        }
+                    } catch(_) {}
+                });
+            }
+            return ws;
+        }
+        PatchedWebSocket.prototype = _WS.prototype;
+        PatchedWebSocket.CONNECTING = _WS.CONNECTING;
+        PatchedWebSocket.OPEN = _WS.OPEN;
+        PatchedWebSocket.CLOSING = _WS.CLOSING;
+        PatchedWebSocket.CLOSED = _WS.CLOSED;
+        window.WebSocket = PatchedWebSocket;
+    })();
 
     // Keep Notification API mock for compatibility — reported as granted so
     // the web app does not prompt the user for permission.
