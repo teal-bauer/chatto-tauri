@@ -10,7 +10,14 @@ use tauri::{
 use tauri::{WebviewUrl, WebviewWindowBuilder};
 
 use serde_json::json;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, Ordering};
+
+// Tracks the host that started an /instances/add OIDC flow. While set, all
+// navigations are kept inside the webview so the redirect chain can complete
+// and the link-back lands here instead of in the system browser.
+#[cfg(desktop)]
+static INSTANCE_FLOW_ORIGIN: Mutex<Option<String>> = Mutex::new(None);
 
 const DEFAULT_SERVER_URL: &str = "https://chat.chatto.run";
 
@@ -216,6 +223,10 @@ const EXTERNAL_LINK_JS: &str = r#"
     window.__chattoExternalLinks = true;
 
     var serverHost = window.location.hostname;
+    // Updated by check_instance_flow on page load. While true, no link is
+    // externalized — we're walking through an OIDC redirect chain that started
+    // on /instances/add and will land back on the origin host.
+    var inInstanceFlow = false;
 
     function isExternal(url) {
         try {
@@ -227,6 +238,11 @@ const EXTERNAL_LINK_JS: &str = r#"
         } catch(e) { return false; }
     }
 
+    function shouldExternalize(url) {
+        if (inInstanceFlow) return false;
+        return isExternal(url);
+    }
+
     function openExternal(url) {
         if (window.__TAURI_INTERNALS__) {
             window.__TAURI_INTERNALS__.invoke('plugin:opener|open_url', { url: url })
@@ -234,25 +250,36 @@ const EXTERNAL_LINK_JS: &str = r#"
         }
     }
 
-    document.addEventListener('click', function(e) {
-        var a = e.target.closest('a[href]');
-        if (!a) return;
-        var href = a.href;
-        if (isExternal(href)) {
-            e.preventDefault();
-            e.stopPropagation();
-            openExternal(href);
-        }
-    }, true);
+    function installHandlers() {
+        document.addEventListener('click', function(e) {
+            var a = e.target.closest('a[href]');
+            if (!a) return;
+            var href = a.href;
+            if (shouldExternalize(href)) {
+                e.preventDefault();
+                e.stopPropagation();
+                openExternal(href);
+            }
+        }, true);
 
-    var origOpen = window.open;
-    window.open = function(url) {
-        if (url && isExternal(url)) {
-            openExternal(url);
-            return null;
-        }
-        return origOpen.apply(window, arguments);
-    };
+        var origOpen = window.open;
+        window.open = function(url) {
+            if (url && shouldExternalize(url)) {
+                openExternal(url);
+                return null;
+            }
+            return origOpen.apply(window, arguments);
+        };
+    }
+
+    if (window.__TAURI_INTERNALS__) {
+        window.__TAURI_INTERNALS__.invoke('check_instance_flow', { url: window.location.href })
+            .then(function(active) { inInstanceFlow = !!active; })
+            .catch(function() {})
+            .finally(installHandlers);
+    } else {
+        installHandlers();
+    }
 })();
 "#;
 
@@ -342,6 +369,38 @@ fn get_server_url(app: tauri::AppHandle) -> Result<Option<String>, String> {
     Ok(store
         .get("server_url")
         .and_then(|v| v.as_str().map(|s| s.to_string())))
+}
+
+// Tracks an active /instances/add OIDC chain. Called by the injected JS on
+// every page load with the current URL; returns whether the page should keep
+// outbound links inside the webview.
+#[cfg(desktop)]
+#[tauri::command]
+fn check_instance_flow(url: String) -> Result<bool, String> {
+    let parsed: tauri::Url = url.parse().map_err(|e| format!("Invalid URL: {e}"))?;
+    let host = parsed.host_str().unwrap_or("").to_string();
+    let path = parsed.path().to_string();
+
+    let mut origin = INSTANCE_FLOW_ORIGIN.lock().map_err(|e| e.to_string())?;
+
+    // Entering (or refreshing) the add-instance entry page on some host —
+    // remember it as the origin of the flow.
+    if path.starts_with("/instances/add") {
+        *origin = Some(host);
+        return Ok(true);
+    }
+
+    // Mid-flow: any non-origin host counts as still inside the OIDC chain.
+    // Returning to the origin host on a different path means the flow is done.
+    if let Some(ref o) = *origin {
+        if &host == o {
+            *origin = None;
+            return Ok(false);
+        }
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 #[tauri::command]
@@ -889,6 +948,7 @@ pub fn run() {
         set_notifications_enabled,
         get_autostart_enabled,
         set_autostart_enabled,
+        check_instance_flow,
     ]);
     #[cfg(mobile)]
     let builder = builder.invoke_handler(tauri::generate_handler![
