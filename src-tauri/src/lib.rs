@@ -152,6 +152,123 @@ const NOTIFICATION_BRIDGE_JS: &str = r#"
 })();
 "#;
 
+// Ensure the remote page has viewport-fit=cover so env(safe-area-inset-*)
+// resolves to real values. On true edge-to-edge mode (Android 15+ default),
+// the WebView extends behind status and gesture bars; pages without
+// viewport-fit=cover see env() resolve to 0 and their content gets clipped.
+#[cfg(mobile)]
+const MOBILE_VIEWPORT_FIT_JS: &str = r#"
+(function() {
+    if (window.__chattoViewportFit) return;
+    window.__chattoViewportFit = true;
+
+    function ensureViewport() {
+        var meta = document.querySelector('meta[name="viewport"]');
+        if (!meta) {
+            meta = document.createElement('meta');
+            meta.setAttribute('name', 'viewport');
+            meta.setAttribute('content', 'width=device-width, initial-scale=1, viewport-fit=cover');
+            (document.head || document.documentElement).appendChild(meta);
+            return;
+        }
+        var content = meta.getAttribute('content') || '';
+        if (!/viewport-fit\s*=/i.test(content)) {
+            meta.setAttribute('content', content.replace(/\s*$/, '') + (content ? ', ' : '') + 'viewport-fit=cover');
+        }
+    }
+
+    if (document.head) {
+        ensureViewport();
+    } else {
+        var obs = new MutationObserver(function() {
+            if (document.head) {
+                ensureViewport();
+                obs.disconnect();
+            }
+        });
+        obs.observe(document.documentElement, { childList: true, subtree: true });
+    }
+})();
+"#;
+
+// VisualViewport-based keyboard shim. The remote Chatto web app sometimes
+// double-pads when the keyboard appears (the WebView shrinks via adjustResize
+// AND the page reserves keyboard space itself, leaving whitespace above the
+// IME). This shim:
+//   - Exposes the visible viewport height as --chatto-vv-height
+//   - Exposes the keyboard height (innerHeight - vv.height) as --chatto-vv-kbd
+//   - Forces html { height: 100dvh } so layout follows the visible area when
+//     the page wasn't designed for it
+//   - Scrolls focused inputs into view above the keyboard
+#[cfg(target_os = "android")]
+const KEYBOARD_VIEWPORT_SHIM_JS: &str = r#"
+(function() {
+    if (window.__chattoKbdShim) return;
+    window.__chattoKbdShim = true;
+
+    function injectStyle() {
+        if (document.getElementById('chatto-kbd-shim-style')) return;
+        var s = document.createElement('style');
+        s.id = 'chatto-kbd-shim-style';
+        s.textContent = [
+            'html { min-height: 100dvh; }',
+            // Pages that use 100vh on body get the dynamic equivalent so they
+            // match the visible viewport when the keyboard is up.
+            'body { min-height: 100dvh; }'
+        ].join('\n');
+        (document.head || document.documentElement).appendChild(s);
+    }
+
+    function update() {
+        var vv = window.visualViewport;
+        if (!vv) return;
+        var kbd = Math.max(0, window.innerHeight - vv.height);
+        var r = document.documentElement;
+        if (r && r.style) {
+            r.style.setProperty('--chatto-vv-height', vv.height + 'px');
+            r.style.setProperty('--chatto-vv-kbd', kbd + 'px');
+        }
+    }
+
+    function onFocus(e) {
+        var t = e.target;
+        if (!t || !t.matches) return;
+        if (!t.matches('input, textarea, select, [contenteditable=""], [contenteditable="true"]')) return;
+        // Wait for the IME to settle before scrolling. 350ms covers most
+        // Android IMEs without feeling laggy.
+        setTimeout(function() {
+            try {
+                t.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' });
+            } catch (_) {
+                try { t.scrollIntoView(false); } catch(_) {}
+            }
+        }, 350);
+    }
+
+    function init() {
+        injectStyle();
+        if (window.visualViewport) {
+            window.visualViewport.addEventListener('resize', update);
+            window.visualViewport.addEventListener('scroll', update);
+        }
+        document.addEventListener('focusin', onFocus, true);
+        update();
+    }
+
+    if (document.head) {
+        init();
+    } else {
+        var obs = new MutationObserver(function() {
+            if (document.head) {
+                init();
+                obs.disconnect();
+            }
+        });
+        obs.observe(document.documentElement, { childList: true, subtree: true });
+    }
+})();
+"#;
+
 #[cfg(target_os = "android")]
 const ACTIVE_ROOM_TRACKER_JS: &str = r#"
 (function() {
@@ -351,7 +468,6 @@ fn set_server_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
     window.navigate(parsed).map_err(|e| e.to_string())
 }
 
-#[cfg(desktop)]
 #[tauri::command]
 fn clear_server_url(app: tauri::AppHandle) -> Result<(), String> {
     let store = app.store("config.json").map_err(|e| e.to_string())?;
@@ -890,10 +1006,14 @@ fn create_main_window(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>
     let builder = builder.initialization_script(EXTERNAL_LINK_JS);
 
     #[cfg(mobile)]
-    let builder = builder.initialization_script(MOBILE_SETTINGS_BUTTON_JS);
+    let builder = builder
+        .initialization_script(MOBILE_VIEWPORT_FIT_JS)
+        .initialization_script(MOBILE_SETTINGS_BUTTON_JS);
 
     #[cfg(target_os = "android")]
-    let builder = builder.initialization_script(ACTIVE_ROOM_TRACKER_JS);
+    let builder = builder
+        .initialization_script(KEYBOARD_VIEWPORT_SHIM_JS)
+        .initialization_script(ACTIVE_ROOM_TRACKER_JS);
 
     #[cfg(desktop)]
     let builder = {
@@ -954,6 +1074,7 @@ pub fn run() {
     let builder = builder.invoke_handler(tauri::generate_handler![
         set_server_url,
         get_server_url,
+        clear_server_url,
         open_settings,
         show_notification,
         get_notifications_enabled,

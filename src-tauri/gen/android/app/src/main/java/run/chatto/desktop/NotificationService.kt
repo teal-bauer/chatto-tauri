@@ -147,7 +147,20 @@ class NotificationService : Service() {
 
     private fun getCookies(serverUrl: String): String? {
         return try {
-            CookieManager.getInstance().getCookie(serverUrl)
+            val cm = CookieManager.getInstance()
+            // The WebView may not have flushed cookies to the persistent
+            // store yet — flush before reading so freshly-set session cookies
+            // are visible to this service.
+            cm.flush()
+            val cookies = cm.getCookie(serverUrl)
+            if (cookies.isNullOrBlank()) {
+                Log.w(TAG, "CookieManager returned no cookies for $serverUrl")
+            } else {
+                // Don't log cookie values; only names so we know what's available.
+                val names = cookies.split(';').mapNotNull { it.substringBefore('=', "").trim().takeIf { n -> n.isNotEmpty() } }
+                Log.d(TAG, "CookieManager has cookies: $names")
+            }
+            cookies
         } catch (e: Exception) {
             Log.w(TAG, "Failed to read cookies: ${e.message}")
             null
@@ -325,14 +338,29 @@ class NotificationService : Service() {
         client?.newCall(request)?.enqueue(object : Callback {
             override fun onFailure(call: Call, e: java.io.IOException) {
                 Log.w(TAG, "Failed to fetch room event: ${e.message}")
-                showMessageNotification("Chatto", "New message", null, null, null)
+                showMessageNotification("Chatto", "New message (network error)", null, null, null)
             }
 
             override fun onResponse(call: Call, response: Response) {
                 try {
                     val rawBody = response.body?.string() ?: "{}"
-                    Log.d(TAG, "GraphQL response (${response.code}): ${rawBody.take(500)}")
+                    val code = response.code
+                    Log.d(TAG, "GraphQL response (HTTP $code, ${rawBody.length} bytes): ${rawBody.take(800)}")
+
+                    if (code != 200) {
+                        Log.w(TAG, "GraphQL non-200 response: $code")
+                        showMessageNotification("Chatto", "New message (HTTP $code)", null, null, "$serverUrl/chat/$spaceId/$roomId")
+                        return
+                    }
+
                     val json = JSONObject(rawBody)
+                    val errors = json.optJSONArray("errors")
+                    if (errors != null && errors.length() > 0) {
+                        Log.w(TAG, "GraphQL errors: $errors")
+                        showMessageNotification("Chatto", "New message (gql error)", null, null, "$serverUrl/chat/$spaceId/$roomId")
+                        return
+                    }
+
                     val data = json.optJSONObject("data")
 
                     val spaceName = data?.optJSONObject("space")?.optString("name")
@@ -342,17 +370,26 @@ class NotificationService : Service() {
                     if (events != null && events.length() > 0) {
                         val ev = events.getJSONObject(0)
                         val actor = ev.optJSONObject("actor")?.optString("displayName") ?: "Chatto"
-                        val msgBody = ev.optJSONObject("event")?.optString("body")
+                        val eventNode = ev.optJSONObject("event")
+                        // Tolerate schema drift: try a few likely field names for the message text.
+                        val msgBody = eventNode?.let { node ->
+                            listOf("body", "text", "content", "message").firstNotNullOfOrNull { f ->
+                                node.optString(f, "").takeIf { it.isNotBlank() }
+                            }
+                        }
                         if (!msgBody.isNullOrBlank()) {
                             showMessageNotification(actor, msgBody, spaceName, roomName, "$serverUrl/chat/$spaceId/$roomId")
                             return
+                        } else {
+                            Log.w(TAG, "MessagePostedEvent had no recognised body field. Keys: ${eventNode?.keys()?.asSequence()?.toList()}")
                         }
+                    } else {
+                        Log.w(TAG, "GraphQL returned no roomEvents")
                     }
-                    // Fallback
-                    showMessageNotification("Chatto", "New message", spaceName, roomName, "$serverUrl/chat/$spaceId/$roomId")
+                    showMessageNotification("Chatto", "New message (empty body)", spaceName, roomName, "$serverUrl/chat/$spaceId/$roomId")
                 } catch (e: Exception) {
-                    Log.w(TAG, "Failed to parse room event: ${e.message}")
-                    showMessageNotification("Chatto", "New message", null, null, null)
+                    Log.w(TAG, "Failed to parse room event: ${e.message}", e)
+                    showMessageNotification("Chatto", "New message (parse error)", null, null, null)
                 }
             }
         })
