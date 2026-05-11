@@ -106,6 +106,10 @@ const NOTIFICATION_BRIDGE_JS: &str = r#"
                         var e = events.event;
                         var type = e.__typename;
                         if (!window.__chattoWindowHidden) return;
+                        // On Android the foreground NotificationService owns the
+                        // background notification path. Letting the WebView fire
+                        // here too would double up.
+                        if (window.ChattoAndroid) return;
                         if (type === 'NotificationCreatedEvent' && e.roomId) {
                             __chattoFetchEventAndNotify(e.roomId, e.eventId);
                         }
