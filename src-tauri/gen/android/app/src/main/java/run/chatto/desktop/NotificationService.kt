@@ -254,7 +254,7 @@ class NotificationService : Service() {
                                 myInstanceEvents {
                                     event {
                                         __typename
-                                        ... on NotificationCreatedEvent { spaceId roomId }
+                                        ... on NotificationCreatedEvent { roomId eventId }
                                     }
                                 }
                             }
@@ -272,14 +272,12 @@ class NotificationService : Service() {
 
                 val typeName = event.optString("__typename")
                 Log.d(TAG, "Event: $typeName ${event.toString().take(200)}")
-                // Only handle NotificationCreatedEvent — MentionNotificationEvent
-                // fires alongside it and would cause duplicates.
                 if (typeName == "NotificationCreatedEvent") {
                     val roomId = event.optString("roomId", "")
-                    val spaceId = event.optString("spaceId", "DM")
+                    val eventId = event.optString("eventId", "").takeIf { it.isNotBlank() }
                     if (roomId == activeRoomId) return
                     if (roomId.isNotBlank() && shouldFire(roomId)) {
-                        fetchRoomEventAndNotify(spaceId, roomId)
+                        fetchRoomEventAndNotify(roomId, eventId)
                     } else {
                         Log.d(TAG, "Skipped: roomId=$roomId activeRoom=$activeRoomId shouldFire=${roomId.isNotBlank()}")
                     }
@@ -307,22 +305,22 @@ class NotificationService : Service() {
 
     // --- Fetch message body via GraphQL HTTP ---
 
-    private fun fetchRoomEventAndNotify(spaceId: String, roomId: String) {
+    private fun fetchRoomEventAndNotify(roomId: String, eventId: String?) {
         val serverUrl = getServerUrl()
         val cookies = getCookies(serverUrl) ?: return
 
-        val isDm = spaceId == "DM"
-        // For DMs, skip space/room name lookup — there's no meaningful space or channel name
-        val gql = if (isDm) {
-            "query(\$s:ID!,\$r:ID!){roomEvents(spaceId:\$s,roomId:\$r,limit:1){actor{displayName}event{__typename...on MessagePostedEvent{body}}}}"
+        // Prefer fetching the exact event (we get eventId from NotificationCreatedEvent
+        // since spaces were phased out). Fall back to the room's latest event.
+        val gql = if (eventId != null) {
+            "query(\$r:ID!,\$e:ID!){roomEventByEventId(roomId:\$r,eventId:\$e){actor{displayName}event{__typename...on MessagePostedEvent{body}}} room(roomId:\$r){name}}"
         } else {
-            "query(\$s:ID!,\$r:ID!){roomEvents(spaceId:\$s,roomId:\$r,limit:1){actor{displayName}event{__typename...on MessagePostedEvent{body}}} room(spaceId:\$s,roomId:\$r){name} space(id:\$s){name}}"
+            "query(\$r:ID!){roomEvents(roomId:\$r,limit:1){actor{displayName}event{__typename...on MessagePostedEvent{body}}} room(roomId:\$r){name}}"
         }
         val query = JSONObject().apply {
             put("query", gql)
             put("variables", JSONObject().apply {
-                put("s", spaceId)
                 put("r", roomId)
+                if (eventId != null) put("e", eventId)
             })
         }
 
@@ -334,11 +332,12 @@ class NotificationService : Service() {
             .post(body)
             .build()
 
-        // Run on OkHttp's thread pool
+        val chatUrl = "$serverUrl/chat/$roomId"
+
         client?.newCall(request)?.enqueue(object : Callback {
             override fun onFailure(call: Call, e: java.io.IOException) {
                 Log.w(TAG, "Failed to fetch room event: ${e.message}")
-                showMessageNotification("Chatto", "New message (network error)", null, null, null)
+                showMessageNotification("Chatto", "New message (network error)", null, chatUrl)
             }
 
             override fun onResponse(call: Call, response: Response) {
@@ -349,7 +348,7 @@ class NotificationService : Service() {
 
                     if (code != 200) {
                         Log.w(TAG, "GraphQL non-200 response: $code")
-                        showMessageNotification("Chatto", "New message (HTTP $code)", null, null, "$serverUrl/chat/$spaceId/$roomId")
+                        showMessageNotification("Chatto", "New message (HTTP $code)", null, chatUrl)
                         return
                     }
 
@@ -357,39 +356,38 @@ class NotificationService : Service() {
                     val errors = json.optJSONArray("errors")
                     if (errors != null && errors.length() > 0) {
                         Log.w(TAG, "GraphQL errors: $errors")
-                        showMessageNotification("Chatto", "New message (gql error)", null, null, "$serverUrl/chat/$spaceId/$roomId")
+                        showMessageNotification("Chatto", "New message (gql error)", null, chatUrl)
                         return
                     }
 
                     val data = json.optJSONObject("data")
+                    val roomName = data?.optJSONObject("room")?.optString("name")?.takeIf { it.isNotBlank() }
 
-                    val spaceName = data?.optJSONObject("space")?.optString("name")
-                    val roomName = data?.optJSONObject("room")?.optString("name")
+                    // Either single event (roomEventByEventId) or array of events (roomEvents).
+                    val ev = data?.optJSONObject("roomEventByEventId")
+                        ?: data?.optJSONArray("roomEvents")?.takeIf { it.length() > 0 }?.getJSONObject(0)
 
-                    val events = data?.optJSONArray("roomEvents")
-                    if (events != null && events.length() > 0) {
-                        val ev = events.getJSONObject(0)
+                    if (ev != null) {
                         val actor = ev.optJSONObject("actor")?.optString("displayName") ?: "Chatto"
                         val eventNode = ev.optJSONObject("event")
-                        // Tolerate schema drift: try a few likely field names for the message text.
                         val msgBody = eventNode?.let { node ->
                             listOf("body", "text", "content", "message").firstNotNullOfOrNull { f ->
                                 node.optString(f, "").takeIf { it.isNotBlank() }
                             }
                         }
                         if (!msgBody.isNullOrBlank()) {
-                            showMessageNotification(actor, msgBody, spaceName, roomName, "$serverUrl/chat/$spaceId/$roomId")
+                            showMessageNotification(actor, msgBody, roomName, chatUrl)
                             return
                         } else {
-                            Log.w(TAG, "MessagePostedEvent had no recognised body field. Keys: ${eventNode?.keys()?.asSequence()?.toList()}")
+                            Log.w(TAG, "Event had no recognised body field. Type: ${eventNode?.optString("__typename")} keys: ${eventNode?.keys()?.asSequence()?.toList()}")
                         }
                     } else {
-                        Log.w(TAG, "GraphQL returned no roomEvents")
+                        Log.w(TAG, "GraphQL returned no event for roomId=$roomId eventId=$eventId")
                     }
-                    showMessageNotification("Chatto", "New message (empty body)", spaceName, roomName, "$serverUrl/chat/$spaceId/$roomId")
+                    showMessageNotification("Chatto", "New message (empty body)", roomName, chatUrl)
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed to parse room event: ${e.message}", e)
-                    showMessageNotification("Chatto", "New message (parse error)", null, null, null)
+                    showMessageNotification("Chatto", "New message (parse error)", null, chatUrl)
                 }
             }
         })
@@ -402,7 +400,6 @@ class NotificationService : Service() {
     private fun showMessageNotification(
         title: String,
         body: String,
-        spaceName: String?,
         roomName: String?,
         navigateUrl: String?
     ) {
@@ -417,14 +414,6 @@ class NotificationService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        // Build context line: "#channel in Space" or just "#channel" or just "Space"
-        val context = when {
-            !roomName.isNullOrBlank() && !spaceName.isNullOrBlank() -> "#$roomName in $spaceName"
-            !roomName.isNullOrBlank() -> "#$roomName"
-            !spaceName.isNullOrBlank() -> spaceName
-            else -> null
-        }
-
         val builder = Notification.Builder(this, NOTIF_CHANNEL_ID)
             .setContentTitle(title)
             .setContentText(body)
@@ -432,8 +421,8 @@ class NotificationService : Service() {
             .setContentIntent(pending)
             .setAutoCancel(true)
 
-        if (context != null) {
-            builder.setSubText(context)
+        if (!roomName.isNullOrBlank()) {
+            builder.setSubText("#$roomName")
         }
 
         val mgr = getSystemService(NotificationManager::class.java)

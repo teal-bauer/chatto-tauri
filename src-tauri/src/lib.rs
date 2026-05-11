@@ -50,26 +50,34 @@ const NOTIFICATION_BRIDGE_JS: &str = r#"
         return true;
     }
 
-    // Fetch the latest room event and show a native notification with the
-    // actual message body. The /api/graphql endpoint is same-origin so the
-    // request carries the user's session cookies automatically.
-    // NotificationCreatedEvent provides spaceId+roomId; DMs use spaceId="DM".
-    function __chattoFetchRoomAndNotify(spaceId, roomId) {
+    // Fetch the message body and show a native notification. Prefers
+    // roomEventByEventId(roomId, eventId) since NotificationCreatedEvent
+    // exposes eventId; falls back to the room's latest event when eventId
+    // is missing. The /api/graphql endpoint is same-origin so the request
+    // carries the user's session cookies automatically.
+    function __chattoFetchEventAndNotify(roomId, eventId) {
         if (!window.__TAURI_INTERNALS__) return;
         if (!__chattoShouldFire(roomId)) return;
+        var query, variables;
+        if (eventId) {
+            query = 'query($r:ID!,$e:ID!){roomEventByEventId(roomId:$r,eventId:$e){actor{displayName}event{__typename...on MessagePostedEvent{body}}}}';
+            variables = {r: roomId, e: eventId};
+        } else {
+            query = 'query($r:ID!){roomEvents(roomId:$r,limit:1){actor{displayName}event{__typename...on MessagePostedEvent{body}}}}';
+            variables = {r: roomId};
+        }
         fetch('/api/graphql', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({
-                query: 'query($s:ID!,$r:ID!){roomEvents(spaceId:$s,roomId:$r,limit:1){actor{displayName}event{__typename...on MessagePostedEvent{body}}}}',
-                variables: {s: spaceId, r: roomId}
-            })
+            body: JSON.stringify({ query: query, variables: variables })
         })
         .then(function(r) { return r.json(); })
         .then(function(data) {
-            var events = data && data.data && data.data.roomEvents;
-            if (!events || !events.length) return;
-            var ev = events[0];
+            var d = data && data.data;
+            if (!d) return;
+            var ev = d.roomEventByEventId
+                || (d.roomEvents && d.roomEvents.length && d.roomEvents[0]);
+            if (!ev) return;
             var actor = ev.actor && ev.actor.displayName;
             var body = ev.event && ev.event.body;
             if (!body) return; // not a message event (e.g. join/leave)
@@ -99,19 +107,7 @@ const NOTIFICATION_BRIDGE_JS: &str = r#"
                         var type = e.__typename;
                         if (!window.__chattoWindowHidden) return;
                         if (type === 'NotificationCreatedEvent' && e.roomId) {
-                            // spaceId is "DM" for direct messages, a real ID for space rooms
-                            __chattoFetchRoomAndNotify(e.spaceId || 'DM', e.roomId);
-                        } else if (type === 'MentionNotificationEvent') {
-                            // Mentions fire alongside NotificationCreatedEvent; let that handle it
-                            // to avoid duplicates. Keep this as fallback if spaceId is missing.
-                            if (!e.spaceId && window.__TAURI_INTERNALS__) {
-                                window.__TAURI_INTERNALS__.invoke('show_notification', {
-                                    title: (e.space && e.space.name) || 'Chatto',
-                                    body: (e.mentionedBy && e.mentionedBy.displayName || 'Someone')
-                                        + ' mentioned you in #'
-                                        + (e.room && e.room.name || 'a room')
-                                }).catch(function() {});
-                            }
+                            __chattoFetchEventAndNotify(e.roomId, e.eventId);
                         }
                     } catch(_) {}
                 });
@@ -276,7 +272,10 @@ const ACTIVE_ROOM_TRACKER_JS: &str = r#"
     window.__chattoRoomTracker = true;
 
     function reportRoom() {
-        var m = window.location.pathname.match(/^\/chat\/[^\/]+\/([^\/]+)/);
+        // Tolerate both /chat/<roomId> (current) and /chat/<spaceId>/<roomId>
+        // (legacy, in case it lingers somewhere). roomId is the segment that
+        // ends the path or precedes the next slash.
+        var m = window.location.pathname.match(/^\/chat\/(?:[^\/]+\/)?([^\/?#]+)/);
         var roomId = m ? m[1] : '';
         // Call Android JavascriptInterface directly — no Rust IPC needed
         if (window.ChattoAndroid && window.ChattoAndroid.setActiveRoom) {
