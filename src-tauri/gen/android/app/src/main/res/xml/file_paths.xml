@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- Scoped to the specific subdirectories file upload/download actually touch,
+     instead of exposing the whole external/cache root through the FileProvider. -->
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
-  <external-path name="my_images" path="." />
-  <cache-path name="my_cache_images" path="." />
+  <external-files-path name="uploads" path="uploads/" />
+  <external-files-path name="downloads" path="Download/" />
+  <cache-path name="shared_cache" path="shared/" />
 </paths>

@@ -1,6 +1,16 @@
 <resources xmlns:tools="http://schemas.android.com/tools">
     <!-- Base application theme. -->
     <style name="Theme.chatto_desktop" parent="Theme.MaterialComponents.DayNight.NoActionBar">
-        <!-- Customize your theme here. -->
+        <item name="android:windowBackground">@color/chatto_background_light</item>
+    </style>
+
+    <!-- Launch theme: Android 12+ splash (backwards-compatible via
+         androidx.core:core-splashscreen). installSplashScreen() swaps to
+         postSplashScreenTheme once the activity is up, so a cold start paints
+         the branded splash instead of a blank frame. -->
+    <style name="Theme.chatto_desktop.Splash" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/chatto_background_light</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_splash</item>
+        <item name="postSplashScreenTheme">@style/Theme.chatto_desktop</item>
     </style>
 </resources>

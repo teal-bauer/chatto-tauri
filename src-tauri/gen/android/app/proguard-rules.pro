@@ -12,6 +12,14 @@
 #   public *;
 #}
 
+# Keep the custom JS bridge exposed to the WebView as window.ChattoAndroid.
+# Release builds strip/rename @JavascriptInterface methods otherwise, which
+# silently breaks setActiveRoom(). Mirrors the generated proguard-wry.pro rule
+# for run.chatto.desktop.Ipc.
+-keepclassmembers class run.chatto.desktop.MainActivity$ChattoJsBridge {
+  @android.webkit.JavascriptInterface <methods>;
+}
+
 # Uncomment this to preserve the line number information for
 # debugging stack traces.
 #-keepattributes SourceFile,LineNumberTable

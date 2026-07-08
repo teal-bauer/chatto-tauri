@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="purple_200">#FFBB86FC</color>
-    <color name="purple_500">#FF6200EE</color>
-    <color name="purple_700">#FF3700B3</color>
-    <color name="teal_200">#FF03DAC5</color>
-    <color name="teal_700">#FF018786</color>
-    <color name="black">#FF000000</color>
-    <color name="white">#FFFFFFFF</color>
+    <!-- Single source of truth for the app/window background. Mirrored in Kotlin
+         (MainActivity) and the themes so the band behind the transparent system
+         bars matches in both light and dark. -->
+    <color name="chatto_background_light">#FFFFFFFF</color>
+    <color name="chatto_background_dark">#FF171717</color>
+    <!-- Brand accent, matches the adaptive launcher background. -->
+    <color name="chatto_accent">#FF86BCED</color>
 </resources>
