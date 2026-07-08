@@ -11,13 +11,14 @@ use tauri::{WebviewUrl, WebviewWindowBuilder};
 
 use serde_json::json;
 use std::sync::Mutex;
+#[cfg(desktop)]
 use std::sync::atomic::{AtomicI32, Ordering};
 
-// Tracks the host that started an /instances/add OIDC flow. While set, all
-// navigations are kept inside the webview so the redirect chain can complete
-// and the link-back lands here instead of in the system browser.
-#[cfg(desktop)]
-static INSTANCE_FLOW_ORIGIN: Mutex<Option<String>> = Mutex::new(None);
+// The configured server origin host (e.g. "chat.chatto.run"), captured at window
+// creation. External-link handling keys off this: while the webview sits on a
+// FOREIGN host (an OIDC provider mid-flow) links stay inside the webview; while
+// on the configured origin host, foreign-host clicks are externalized.
+static CONFIGURED_ORIGIN_HOST: Mutex<Option<String>> = Mutex::new(None);
 
 const DEFAULT_SERVER_URL: &str = "https://chat.chatto.run";
 
@@ -40,78 +41,175 @@ const NOTIFICATION_BRIDGE_JS: &str = r#"
         });
     } catch(e) {}
 
-    // Deduplication: track recently fired notifications by key (roomId or notificationId)
-    // to avoid firing twice when multiple WebSocket connections deliver the same event.
+    // Forward Badging API calls to the native dock/taskbar badge. The web app
+    // uses navigator.setAppBadge(count) / clearAppBadge() for the unread count.
+    try {
+        navigator.setAppBadge = function(count) {
+            if (window.__TAURI_INTERNALS__) {
+                var n = (typeof count === 'number' && isFinite(count)) ? Math.floor(count) : null;
+                window.__TAURI_INTERNALS__.invoke('set_badge', { count: n }).catch(function() {});
+            }
+            return Promise.resolve();
+        };
+        navigator.clearAppBadge = function() {
+            if (window.__TAURI_INTERNALS__) {
+                window.__TAURI_INTERNALS__.invoke('set_badge', { count: null }).catch(function() {});
+            }
+            return Promise.resolve();
+        };
+    } catch(e) {}
+
+    // Deduplication: track recently fired notifications by event_id (fallback
+    // notification_id) to avoid firing twice when multiple sockets deliver the
+    // same event. Keying on the event id — not roomId — so distinct rapid
+    // messages in the same room are not wrongly dropped.
     var __chattoRecentNotifKeys = {};
     function __chattoShouldFire(key) {
         var now = Date.now();
+        for (var k in __chattoRecentNotifKeys) {
+            if (now - __chattoRecentNotifKeys[k] > 3000) delete __chattoRecentNotifKeys[k];
+        }
         if (__chattoRecentNotifKeys[key] && now - __chattoRecentNotifKeys[key] < 3000) return false;
         __chattoRecentNotifKeys[key] = now;
         return true;
     }
 
-    // Fetch the message body and show a native notification. Prefers
-    // roomEventByEventId(roomId, eventId) since NotificationCreatedEvent
-    // exposes eventId; falls back to the room's latest event when eventId
-    // is missing. The /api/graphql endpoint is same-origin so the request
-    // carries the user's session cookies automatically.
+    // --- Minimal hand-rolled protobuf field walker ---------------------------
+    // The realtime socket speaks binary protobuf. We only need to reach a few
+    // fields, so walk the wire format directly instead of pulling in a codec.
+    // wire types: 0=VARINT, 1=I64, 2=LEN, 5=I32. Field/length varints are small
+    // enough to stay within 32 bits here.
+    function __pbDecodeUtf8(buf, s, e) {
+        try { return new TextDecoder('utf-8').decode(buf.subarray(s, e)); }
+        catch(_) {
+            var out = '';
+            for (var i = s; i < e; i++) out += String.fromCharCode(buf[i]);
+            try { return decodeURIComponent(escape(out)); } catch(__) { return out; }
+        }
+    }
+    // Returns the LAST field matching `want` in buf[start,end) as
+    // {wire, value, start, end} (start/end are byte offsets for LEN fields), or null.
+    function __pbField(buf, start, end, want) {
+        var i = start, res = null;
+        while (i < end) {
+            var tag = 0, shift = 0, b;
+            do { b = buf[i++]; tag |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80 && i < end);
+            var field = tag >>> 3, wire = tag & 7;
+            if (wire === 0) {
+                var v = 0, m = 1, c;
+                do { c = buf[i++]; v += (c & 0x7f) * m; m *= 128; } while (c & 0x80 && i < end);
+                if (field === want) res = { wire: 0, value: v, start: 0, end: 0 };
+            } else if (wire === 2) {
+                var len = 0, s2 = 0, d;
+                do { d = buf[i++]; len |= (d & 0x7f) << s2; s2 += 7; } while (d & 0x80 && i < end);
+                if (field === want) res = { wire: 2, value: 0, start: i, end: i + len };
+                i += len;
+            } else if (wire === 1) { i += 8; }
+            else if (wire === 5) { i += 4; }
+            else { break; }
+        }
+        return res;
+    }
+    function __pbStr(buf, f) { return (f && f.wire === 2) ? __pbDecodeUtf8(buf, f.start, f.end) : null; }
+
+    // Decode a RealtimeServerFrame → RealtimeEventEnvelope → notification_created.
+    function __chattoHandleFrame(buf) {
+        // On Android the native NotificationService owns the background path;
+        // firing here too would double up.
+        if (window.ChattoAndroid) return;
+        // RealtimeServerFrame.event = field 3 (LEN).
+        var evt = __pbField(buf, 0, buf.length, 3);
+        if (!evt || evt.wire !== 2) return;
+        // RealtimeEventEnvelope.notification_created = field 60 (LEN). Key on this only.
+        var notif = __pbField(buf, evt.start, evt.end, 60);
+        if (!notif || notif.wire !== 2) return;
+        // RealtimeNotificationCreatedEvent fields.
+        var notifId = __pbStr(buf, __pbField(buf, notif.start, notif.end, 1));
+        var roomId  = __pbStr(buf, __pbField(buf, notif.start, notif.end, 2));
+        var eventId = __pbStr(buf, __pbField(buf, notif.start, notif.end, 3));
+        var silentF = __pbField(buf, notif.start, notif.end, 5);
+        if (silentF && silentF.wire === 0 && silentF.value !== 0) return; // silent
+        if (!roomId) return;
+        if (!window.__chattoWindowHidden) return;
+        var key = eventId || notifId || roomId;
+        if (!__chattoShouldFire(key)) return;
+        __chattoFetchEventAndNotify(roomId, eventId);
+    }
+
+    // Hydrate title + body via same-origin ConnectRPC (cookies flow
+    // automatically) and show a native notification. Prefers the exact event
+    // when eventId is known; falls back to the room's latest message otherwise.
     function __chattoFetchEventAndNotify(roomId, eventId) {
         if (!window.__TAURI_INTERNALS__) return;
-        if (!__chattoShouldFire(roomId)) return;
-        var query, variables;
+        var url, body;
         if (eventId) {
-            query = 'query($r:ID!,$e:ID!){roomEventByEventId(roomId:$r,eventId:$e){actor{displayName}event{__typename...on MessagePostedEvent{body}}}}';
-            variables = {r: roomId, e: eventId};
+            url = '/api/connect/chatto.api.v1.RoomService/GetRoomEventsAround';
+            body = { roomId: roomId, eventId: eventId, limit: 1 };
         } else {
-            query = 'query($r:ID!){roomEvents(roomId:$r,limit:1){actor{displayName}event{__typename...on MessagePostedEvent{body}}}}';
-            variables = {r: roomId};
+            url = '/api/connect/chatto.api.v1.RoomService/GetRoomEvents';
+            body = { roomId: roomId, limit: 1 };
         }
-        fetch('/api/graphql', {
+        fetch(url, {
             method: 'POST',
+            credentials: 'include',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ query: query, variables: variables })
+            body: JSON.stringify(body)
         })
         .then(function(r) { return r.json(); })
         .then(function(data) {
-            var d = data && data.data;
-            if (!d) return;
-            var ev = d.roomEventByEventId
-                || (d.roomEvents && d.roomEvents.length && d.roomEvents[0]);
-            if (!ev) return;
-            var actor = ev.actor && ev.actor.displayName;
-            var body = ev.event && ev.event.body;
-            if (!body) return; // not a message event (e.g. join/leave)
+            var page = data && data.page;
+            var events = page && page.events;
+            if (!events || !events.length) return;
+            var anchor = null;
+            if (eventId) {
+                for (var i = 0; i < events.length; i++) {
+                    if (events[i] && events[i].id === eventId) { anchor = events[i]; break; }
+                }
+                if (!anchor && typeof page.targetIndex === 'number'
+                    && page.targetIndex >= 0 && page.targetIndex < events.length) {
+                    var t = events[page.targetIndex];
+                    if (t && t.messagePosted) anchor = t;
+                }
+            }
+            if (!anchor) {
+                for (var j = events.length - 1; j >= 0; j--) {
+                    if (events[j] && events[j].messagePosted) { anchor = events[j]; break; }
+                }
+            }
+            var msg = anchor && anchor.messagePosted && anchor.messagePosted.message;
+            var text = msg && msg.body;
+            if (!text) return; // not a chat message (join/leave/etc.) — suppress
+            var actorId = (msg && msg.actorId) || (anchor && anchor.actorId);
+            var title = 'Chatto';
+            var users = page.includes && page.includes.users;
+            if (users && actorId && users[actorId] && users[actorId].displayName) {
+                title = users[actorId].displayName;
+            }
             window.__TAURI_INTERNALS__.invoke('show_notification', {
-                title: actor || 'Chatto',
-                body: body
+                title: title,
+                body: text
             }).catch(function() {});
         })
         .catch(function() {});
     }
 
-    // Intercept the WebSocket constructor to read the graphql-ws subscription
-    // stream. Chatto uses wss://<host>/api/graphql with the graphql-ws protocol.
-    // Messages arrive as: {"type":"next","payload":{"data":{"myInstanceEvents":{…}}}}
+    // Passively intercept the app's own realtime WebSocket. Chatto uses
+    // wss://<host>/api/realtime with binary protobuf frames (binaryType is
+    // 'arraybuffer'). We only read messages; the app owns the socket.
     (function() {
         var _WS = window.WebSocket;
         function PatchedWebSocket(url, protocols) {
             var ws = protocols !== undefined ? new _WS(url, protocols) : new _WS(url);
-            if (typeof url === 'string' && url.indexOf('/api/graphql') !== -1) {
+            if (typeof url === 'string' && url.indexOf('/api/realtime') !== -1) {
                 ws.addEventListener('message', function(ev) {
                     try {
-                        var msg = JSON.parse(ev.data);
-                        if (msg.type !== 'next') return;
-                        var events = msg.payload && msg.payload.data && msg.payload.data.myInstanceEvents;
-                        if (!events || !events.event) return;
-                        var e = events.event;
-                        var type = e.__typename;
-                        if (!window.__chattoWindowHidden) return;
-                        // On Android the foreground NotificationService owns the
-                        // background notification path. Letting the WebView fire
-                        // here too would double up.
-                        if (window.ChattoAndroid) return;
-                        if (type === 'NotificationCreatedEvent' && e.roomId) {
-                            __chattoFetchEventAndNotify(e.roomId, e.eventId);
+                        var data = ev.data;
+                        if (data instanceof ArrayBuffer) {
+                            __chattoHandleFrame(new Uint8Array(data));
+                        } else if (typeof Blob !== 'undefined' && data instanceof Blob) {
+                            data.arrayBuffer().then(function(ab) {
+                                try { __chattoHandleFrame(new Uint8Array(ab)); } catch(_) {}
+                            });
                         }
                     } catch(_) {}
                 });
@@ -336,16 +434,15 @@ const MOBILE_SETTINGS_BUTTON_JS: &str = r#"
 })();
 "#;
 
-#[cfg(desktop)]
 const EXTERNAL_LINK_JS: &str = r#"
 (function() {
     if (window.__chattoExternalLinks) return;
     window.__chattoExternalLinks = true;
 
     var serverHost = window.location.hostname;
-    // Updated by check_instance_flow on page load. While true, no link is
-    // externalized — we're walking through an OIDC redirect chain that started
-    // on /instances/add and will land back on the origin host.
+    // Updated by check_instance_flow on page load. While true, the page is on a
+    // FOREIGN host (an OIDC provider mid-flow) — keep every link inside the
+    // webview so the redirect chain can complete and land back on the origin.
     var inInstanceFlow = false;
 
     function isExternal(url) {
@@ -490,36 +587,22 @@ fn get_server_url(app: tauri::AppHandle) -> Result<Option<String>, String> {
         .and_then(|v| v.as_str().map(|s| s.to_string())))
 }
 
-// Tracks an active /instances/add OIDC chain. Called by the injected JS on
-// every page load with the current URL; returns whether the page should keep
-// outbound links inside the webview.
-#[cfg(desktop)]
+// Called by the injected JS on every page load with the current URL. Returns
+// whether outbound links should stay inside the webview. Rule: the webview's
+// primary origin is the configured server host; while the page is on a FOREIGN
+// host (an OIDC provider reached via top-level navigation) links stay inside,
+// so the redirect chain completes. On the configured origin host, foreign-host
+// clicks are externalized as usual.
 #[tauri::command]
 fn check_instance_flow(url: String) -> Result<bool, String> {
     let parsed: tauri::Url = url.parse().map_err(|e| format!("Invalid URL: {e}"))?;
-    let host = parsed.host_str().unwrap_or("").to_string();
-    let path = parsed.path().to_string();
-
-    let mut origin = INSTANCE_FLOW_ORIGIN.lock().map_err(|e| e.to_string())?;
-
-    // Entering (or refreshing) the add-instance entry page on some host —
-    // remember it as the origin of the flow.
-    if path.starts_with("/instances/add") {
-        *origin = Some(host);
-        return Ok(true);
-    }
-
-    // Mid-flow: any non-origin host counts as still inside the OIDC chain.
-    // Returning to the origin host on a different path means the flow is done.
-    if let Some(ref o) = *origin {
-        if &host == o {
-            *origin = None;
-            return Ok(false);
-        }
-        return Ok(true);
-    }
-
-    Ok(false)
+    let host = parsed.host_str().unwrap_or("");
+    let configured = CONFIGURED_ORIGIN_HOST.lock().map_err(|e| e.to_string())?;
+    Ok(match configured.as_deref() {
+        Some(origin) => host != origin,
+        // Origin unknown (window not built yet) — default to externalizing.
+        None => false,
+    })
 }
 
 #[tauri::command]
@@ -579,13 +662,30 @@ fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
     window.navigate(url).map_err(|e| e.to_string())
 }
 
-#[cfg(desktop)]
 #[tauri::command]
 fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
+    // On Android/iOS the opener plugin opens the system browser.
     app.opener()
         .open_url(&url, None::<&str>)
         .map_err(|e| e.to_string())
+}
+
+// Forward the web app's Badging API count to the native dock/taskbar badge.
+// Best-effort: no-op on Windows/Android where the platform lacks a badge API.
+#[tauri::command]
+fn set_badge(app: tauri::AppHandle, count: Option<i64>) -> Result<(), String> {
+    // Treat 0 / negative as "clear" so the badge disappears when unread hits 0.
+    let normalized = count.filter(|&c| c > 0);
+    // set_badge_count only exists on the desktop WebviewWindow; mobile has no
+    // dock/taskbar badge, so this is a no-op there.
+    #[cfg(desktop)]
+    if let Some(window) = app.get_webview_window("main") {
+        return window.set_badge_count(normalized).map_err(|e| e.to_string());
+    }
+    #[cfg(not(desktop))]
+    let _ = (&app, normalized);
+    Ok(())
 }
 
 #[cfg(desktop)]
@@ -607,12 +707,43 @@ fn set_autostart_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(), Str
     }
 }
 
+// Query the update endpoint. Shared by the menu-driven check, the startup
+// silent check, and the check_update/install_update IPC commands.
+#[cfg(desktop)]
+async fn fetch_pending_update(
+    app: &tauri::AppHandle,
+) -> Result<Option<tauri_plugin_updater::Update>, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    updater.check().await.map_err(|e| e.to_string())
+}
+
+// Returns Some(version) if an update is available, None if up to date.
+#[cfg(desktop)]
+#[tauri::command]
+async fn check_update(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    Ok(fetch_pending_update(&app).await?.map(|u| u.version.clone()))
+}
+
+// Download + install the pending update, then restart. Errors if none pending.
+#[cfg(desktop)]
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
+    let update = fetch_pending_update(&app)
+        .await?
+        .ok_or("No update available")?;
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|e| e.to_string())?;
+    app.restart()
+}
+
 #[cfg(desktop)]
 async fn do_update_check(app: tauri::AppHandle, silent: bool) {
     use tauri_plugin_notification::NotificationExt;
-    use tauri_plugin_updater::UpdaterExt;
 
-    let updater = match app.updater() {
+    let pending = match fetch_pending_update(&app).await {
         Ok(u) => u,
         Err(e) => {
             if !silent {
@@ -620,15 +751,15 @@ async fn do_update_check(app: tauri::AppHandle, silent: bool) {
                     .notification()
                     .builder()
                     .title("Update check failed")
-                    .body(&e.to_string())
+                    .body(&e)
                     .show();
             }
             return;
         }
     };
 
-    match updater.check().await {
-        Ok(Some(update)) => {
+    match pending {
+        Some(update) => {
             if silent {
                 let _ = app
                     .notification()
@@ -659,23 +790,13 @@ async fn do_update_check(app: tauri::AppHandle, silent: bool) {
                 }
             }
         }
-        Ok(None) => {
+        None => {
             if !silent {
                 let _ = app
                     .notification()
                     .builder()
                     .title("Chatto is up to date")
                     .body(&format!("v{} is the latest version.", app.package_info().version))
-                    .show();
-            }
-        }
-        Err(e) => {
-            if !silent {
-                let _ = app
-                    .notification()
-                    .builder()
-                    .title("Update check failed")
-                    .body(&e.to_string())
                     .show();
             }
         }
@@ -991,6 +1112,52 @@ fn get_server_url_from_store(app: &tauri::AppHandle) -> Option<String> {
         .and_then(|store| store.get("server_url").and_then(|v| v.as_str().map(String::from)))
 }
 
+// Translate a `chatto://` deep link into an https URL on the configured origin
+// host, preserving path + query. The webview can only load http(s), so the raw
+// custom-scheme URL would never load. Returns None for any non-`chatto` scheme.
+fn deep_link_to_web_url(app: &tauri::AppHandle, url: &tauri::Url) -> Option<tauri::Url> {
+    if url.scheme() != "chatto" {
+        return None;
+    }
+    let origin = get_server_url_from_store(app).unwrap_or_else(|| DEFAULT_SERVER_URL.to_string());
+    let origin_url: tauri::Url = origin.parse().ok()?;
+    let scheme = origin_url.scheme();
+    let authority = origin_url.authority(); // host[:port]
+
+    // A custom-scheme URL splits the first segment into `host`; fold it back so
+    // e.g. chatto://chat/-/room and chatto:///chat/-/room both round-trip.
+    let mut path = String::new();
+    if let Some(h) = url.host_str() {
+        path.push_str(h);
+    }
+    path.push_str(url.path());
+    let path = path.trim_start_matches('/');
+
+    let mut target = format!("{scheme}://{authority}/{path}");
+    if let Some(q) = url.query() {
+        target.push('?');
+        target.push_str(q);
+    }
+    target.parse().ok()
+}
+
+// Navigate the main window to a `chatto://` deep link's web equivalent.
+fn handle_deep_link(app: &tauri::AppHandle, url: &tauri::Url) {
+    match deep_link_to_web_url(app, url) {
+        Some(target) => {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.navigate(target);
+                #[cfg(desktop)]
+                {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+        }
+        None => eprintln!("rejected deep link with unexpected scheme: {}", url.scheme()),
+    }
+}
+
 fn create_main_window(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let url = get_server_url_from_store(app.handle())
         .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string());
@@ -1002,11 +1169,16 @@ fn create_main_window(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>
         .ok()
         .and_then(|u| u.host_str().map(String::from));
 
-    let builder = WebviewWindowBuilder::new(app, "main", webview_url)
-        .initialization_script(NOTIFICATION_BRIDGE_JS);
+    // Record the configured origin host so check_instance_flow can tell foreign
+    // (OIDC) hosts from the primary origin on both desktop and mobile.
+    if let Ok(mut guard) = CONFIGURED_ORIGIN_HOST.lock() {
+        *guard = server_host.clone();
+    }
 
-    #[cfg(desktop)]
-    let builder = builder.initialization_script(EXTERNAL_LINK_JS);
+    // External-link handling + OIDC flow runs on all platforms.
+    let builder = WebviewWindowBuilder::new(app, "main", webview_url)
+        .initialization_script(NOTIFICATION_BRIDGE_JS)
+        .initialization_script(EXTERNAL_LINK_JS);
 
     #[cfg(mobile)]
     let builder = builder
@@ -1041,6 +1213,9 @@ fn create_main_window(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>
     };
 
     let window = builder.build()?;
+    // window is only read by the desktop zoom-restore block below.
+    #[cfg(not(desktop))]
+    let _ = &window;
 
     // Restore persisted zoom level
     #[cfg(desktop)]
@@ -1072,6 +1247,9 @@ pub fn run() {
         get_autostart_enabled,
         set_autostart_enabled,
         check_instance_flow,
+        set_badge,
+        check_update,
+        install_update,
     ]);
     #[cfg(mobile)]
     let builder = builder.invoke_handler(tauri::generate_handler![
@@ -1079,9 +1257,12 @@ pub fn run() {
         get_server_url,
         clear_server_url,
         open_settings,
+        open_external_url,
         show_notification,
         get_notifications_enabled,
         set_notifications_enabled,
+        check_instance_flow,
+        set_badge,
     ]);
 
     let builder = builder
@@ -1114,22 +1295,14 @@ pub fn run() {
             #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
             app.deep_link().register_all()?;
 
-            if let Some(urls) = app.deep_link().get_current()? {
-                eprintln!("launched via deep link: {:?}", urls);
-            }
-
+            // Runtime deep links (app already running). Translate chatto:// to the
+            // web equivalent and navigate the main window.
             let app_handle = app.handle().clone();
             app.deep_link().on_open_url(move |event| {
                 let urls = event.urls();
                 eprintln!("deep link opened: {:?}", urls);
                 if let Some(url) = urls.first() {
-                    if url.scheme() != "chatto" {
-                        eprintln!("rejected deep link with unexpected scheme: {}", url.scheme());
-                        return;
-                    }
-                    if let Some(window) = app_handle.get_webview_window("main") {
-                        let _ = window.navigate(url.clone());
-                    }
+                    handle_deep_link(&app_handle, url);
                 }
             });
 
@@ -1143,6 +1316,15 @@ pub fn run() {
 
             // Create main window
             create_main_window(app)?;
+
+            // Cold-start deep link: the app was launched by a chatto:// URL.
+            // Handle after the window exists so navigation lands.
+            if let Some(urls) = app.deep_link().get_current()? {
+                eprintln!("launched via deep link: {:?}", urls);
+                if let Some(url) = urls.first() {
+                    handle_deep_link(app.handle(), url);
+                }
+            }
 
             // Background update check on startup
             #[cfg(desktop)]
