@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { onMount, onDestroy } from "svelte";
+  import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
-  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { getVersion } from "@tauri-apps/api/app";
+  import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 
   let serverUrl = $state("");
   let hasOverride = $state(false);
@@ -13,17 +14,19 @@
   let autostartEnabled = $state(false);
   let autostartAvailable = $state(false);
 
-  let unlisten: UnlistenFn | undefined;
+  let notificationPermissionSupported = $state(false);
+  let osNotificationsGranted = $state(false);
+
+  let appVersion = $state("");
+  let updatesSupported = $state(false);
+  let checkingUpdate = $state(false);
+  let installingUpdate = $state(false);
+  let hasCheckedForUpdate = $state(false);
+  let updateAvailable = $state<string | null>(null);
 
   onMount(async () => {
     const params = new URLSearchParams(window.location.search);
     showSettings = params.has("settings");
-
-    unlisten = await listen("open-settings", () => {
-      showSettings = true;
-      connecting = false;
-      loadPreferences();
-    });
 
     try {
       const url = await invoke<string | null>("get_server_url");
@@ -38,10 +41,6 @@
     loading = false;
   });
 
-  onDestroy(() => {
-    unlisten?.();
-  });
-
   async function loadPreferences() {
     try {
       notificationsEnabled = await invoke<boolean>("get_notifications_enabled");
@@ -54,6 +53,26 @@
     } catch {
       // autostart not available (mobile)
       autostartAvailable = false;
+    }
+    try {
+      osNotificationsGranted = await isPermissionGranted();
+      notificationPermissionSupported = true;
+    } catch {
+      // OS-level permission query not available on this platform
+      notificationPermissionSupported = false;
+    }
+    try {
+      appVersion = await getVersion();
+    } catch {
+      // version display just won't show
+    }
+    try {
+      updateAvailable = await invoke<string | null>("check_update");
+      updatesSupported = true;
+      hasCheckedForUpdate = true;
+    } catch {
+      // updater not available (mobile)
+      updatesSupported = false;
     }
   }
 
@@ -118,6 +137,40 @@
       error = `Failed to update autostart: ${e}`;
     }
   }
+
+  async function allowNotifications() {
+    error = "";
+    try {
+      const permission = await requestPermission();
+      osNotificationsGranted = permission === "granted";
+    } catch (e) {
+      error = `Failed to request notification permission: ${e}`;
+    }
+  }
+
+  async function checkForUpdates() {
+    error = "";
+    checkingUpdate = true;
+    try {
+      updateAvailable = await invoke<string | null>("check_update");
+      hasCheckedForUpdate = true;
+    } catch (e) {
+      error = `Failed to check for updates: ${e}`;
+    }
+    checkingUpdate = false;
+  }
+
+  async function installUpdate() {
+    error = "";
+    installingUpdate = true;
+    try {
+      await invoke("install_update");
+      // App restarts to apply the update — no further state change needed.
+    } catch (e) {
+      error = `Failed to install update: ${e}`;
+      installingUpdate = false;
+    }
+  }
 </script>
 
 {#if loading}
@@ -176,6 +229,14 @@
               <span class="toggle-knob"></span>
             </button>
           </label>
+          {#if notificationPermissionSupported && !osNotificationsGranted}
+            <div class="permission-note">
+              <span class="toggle-hint">
+                The in-app toggle above only takes effect once the OS allows notifications for Chatto.
+              </span>
+              <button type="button" class="link-btn" onclick={allowNotifications}>Allow notifications</button>
+            </div>
+          {/if}
           {#if autostartAvailable}
             <label class="toggle-row">
               <span class="toggle-label">
@@ -196,6 +257,33 @@
             </label>
           {/if}
         </section>
+
+        {#if updatesSupported}
+          <section class="card">
+            <h2>About</h2>
+            <div class="about-row">
+              <span class="toggle-title">Chatto Desktop</span>
+              <span class="toggle-hint">{appVersion ? `Version ${appVersion}` : "Loading version…"}</span>
+            </div>
+
+            {#if updateAvailable}
+              <p class="update-status">Update available: v{updateAvailable}</p>
+            {:else if hasCheckedForUpdate}
+              <p class="update-status">You're up to date.</p>
+            {/if}
+
+            <div class="about-actions">
+              <button type="button" class="link-btn" onclick={checkForUpdates} disabled={checkingUpdate}>
+                {checkingUpdate ? "Checking…" : "Check for Updates"}
+              </button>
+              {#if updateAvailable}
+                <button type="button" class="link-btn" onclick={installUpdate} disabled={installingUpdate}>
+                  {installingUpdate ? "Installing…" : "Install & Restart"}
+                </button>
+              {/if}
+            </div>
+          </section>
+        {/if}
 
         {#if error}
           <p class="error" role="alert">{error}</p>
@@ -482,6 +570,34 @@
 
   .toggle.active .toggle-knob {
     transform: translateX(20px);
+  }
+
+  .permission-note {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.125rem;
+    padding: 0 0 0.75rem;
+    margin-top: -0.25rem;
+  }
+
+  .about-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+  }
+
+  .update-status {
+    margin: 0.75rem 0 0;
+    font-size: 0.875rem;
+    color: var(--fg-muted);
+  }
+
+  .about-actions {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    flex-wrap: wrap;
   }
 
   .error {
