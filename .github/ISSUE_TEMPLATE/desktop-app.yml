@@ -1,6 +1,6 @@
 name: App Issue
 description: Report a bug or request a feature for the Chatto desktop or Android app
-labels: []
+labels: ["needs-triage"]
 body:
   - type: markdown
     attributes:
@@ -25,6 +25,7 @@ body:
         - Windows
         - Linux
         - Android
+        - iOS
     validations:
       required: true
   - type: input
