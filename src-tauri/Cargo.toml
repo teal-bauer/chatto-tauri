@@ -1,6 +1,6 @@
 [package]
 name = "chatto-tauri"
-version = "0.5.0"
+version = "0.6.0"
 description = "Tauri wrapper for Chatto"
 authors = ["Teal Bauer <opensource@teal.is>"]
 license = "AGPL-3.0-or-later"
