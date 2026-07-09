@@ -169,6 +169,7 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+          cache: gradle
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
@@ -179,7 +180,9 @@ jobs:
       - name: Install Rust stable with Android targets
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+          # arm64 + armv7 only. x86_64/i686 are emulator-only ABIs; skipping
+          # them roughly halves the Rust cross-compile, the dominant build cost.
+          targets: aarch64-linux-android,armv7-linux-androideabi
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -190,7 +193,9 @@ jobs:
         run: pnpm install
 
       - name: Build Android APK
-        run: pnpm tauri android build --apk
+        # Build only the ABIs whose Rust targets are installed above (arm64 +
+        # armv7). The result is a universal APK covering all physical devices.
+        run: pnpm tauri android build --apk --target aarch64 --target armv7
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.0.13004108
 
