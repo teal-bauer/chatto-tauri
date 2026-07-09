@@ -1,0 +1,44 @@
+{
+  "packageId": "run.chatto.twa",
+  "host": "chat.chatto.run",
+  "name": "Chatto",
+  "launcherName": "Chatto",
+  "display": "standalone",
+  "orientation": "default",
+  "themeColor": "#e5e7eb",
+  "themeColorDark": "#111827",
+  "navigationColor": "#e5e7eb",
+  "navigationColorDark": "#111827",
+  "navigationDividerColor": "#e5e7eb",
+  "navigationDividerColorDark": "#111827",
+  "backgroundColor": "#f3f4f6",
+  "enableNotifications": true,
+  "startUrl": "/",
+  "iconUrl": "https://chat.chatto.run/icons/icon-512.png",
+  "maskableIconUrl": "https://chat.chatto.run/icons/icon-maskable-512.png",
+  "monochromeIconUrl": "",
+  "webManifestUrl": "https://chat.chatto.run/manifest.webmanifest",
+  "fallbackType": "customtabs",
+  "enableSiteSettingsShortcut": true,
+  "isChromeOSOnly": false,
+  "isMetaQuest": false,
+  "fullScopeUrl": "https://chat.chatto.run/",
+  "minSdkVersion": 24,
+  "appVersionName": "0.5.0",
+  "appVersionCode": 1,
+  "shortcuts": [
+    {
+      "name": "Notifications",
+      "shortName": "Notifications",
+      "url": "https://chat.chatto.run/chat/notifications",
+      "chosenIconUrl": "https://chat.chatto.run/icons/icon-192.png"
+    }
+  ],
+  "signingKey": {
+    "path": "./android-signing.keystore",
+    "alias": "chatto"
+  },
+  "fingerprints": [],
+  "additionalTrustedOrigins": [],
+  "features": {}
+}
