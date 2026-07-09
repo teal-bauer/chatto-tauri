@@ -113,7 +113,10 @@ const NOTIFICATION_BRIDGE_JS: &str = r#"
     function __pbStr(buf, f) { return (f && f.wire === 2) ? __pbDecodeUtf8(buf, f.start, f.end) : null; }
 
     // Decode a RealtimeServerFrame -> RealtimeEventEnvelope -> notification_created.
-    function __chattoHandleFrame(buf) {
+    // serverOrigin is the http(s) origin of the socket this frame arrived on
+    // (see __chattoWsHttpOrigin below), threaded through so hydration hits the
+    // right server, not always the origin host.
+    function __chattoHandleFrame(buf, serverOrigin) {
         // On Android the native NotificationService owns the background path;
         // firing here too would double up.
         if (window.ChattoAndroid) return;
@@ -131,30 +134,83 @@ const NOTIFICATION_BRIDGE_JS: &str = r#"
         if (silentF && silentF.wire === 0 && silentF.value !== 0) return; // silent
         if (!roomId) return;
         if (!window.__chattoWindowHidden) return;
-        var key = eventId || notifId || roomId;
+        // Fold the server origin into the dedup key so the same event id from
+        // two different servers can't wrongly dedupe each other.
+        var key = (serverOrigin || '') + '|' + (eventId || notifId || roomId);
         if (!__chattoShouldFire(key)) return;
-        __chattoFetchEventAndNotify(roomId, eventId);
+        __chattoFetchEventAndNotify(roomId, eventId, serverOrigin);
     }
 
-    // Hydrate title + body via same-origin ConnectRPC (cookies flow
-    // automatically) and show a native notification. Prefers the exact event
-    // when eventId is known; falls back to the room's latest message otherwise.
-    function __chattoFetchEventAndNotify(roomId, eventId) {
+    // Derives the http(s) origin of a WebSocket URL, e.g.
+    // "wss://remote.example/api/realtime" -> "https://remote.example".
+    function __chattoWsHttpOrigin(u) {
+        try {
+            var p = new URL(u, window.location.href);
+            var proto = p.protocol === 'wss:' ? 'https:' : (p.protocol === 'ws:' ? 'http:' : p.protocol);
+            return proto + '//' + p.host;
+        } catch (_) { return window.location.origin; }
+    }
+
+    // Looks up the bearer token for a remote server by origin, from the web
+    // app's own server registry (localStorage 'chatto:instances'). The origin
+    // server uses cookie auth and is not in scope here; this is only consulted
+    // for remote servers.
+    function __chattoTokenForOrigin(origin) {
+        try {
+            var raw = window.localStorage.getItem('chatto:instances');
+            if (!raw) return null;
+            var arr = JSON.parse(raw);
+            if (!Array.isArray(arr)) return null;
+            for (var i = 0; i < arr.length; i++) {
+                var s = arr[i];
+                if (!s || !s.url) continue;
+                var o;
+                try { o = new URL(s.url).origin; } catch (_) { continue; }
+                if (o === origin) return s.token || null;
+            }
+        } catch (_) {}
+        return null;
+    }
+
+    // Hydrate title + body and show a native notification. Prefers the exact
+    // event when eventId is known; falls back to the room's latest message
+    // otherwise. serverOrigin is the origin the notification frame arrived
+    // from (see __chattoWsHttpOrigin): the origin server hydrates via
+    // same-origin ConnectRPC with cookies (unchanged); a remote server
+    // hydrates via an absolute URL with its own bearer token.
+    function __chattoFetchEventAndNotify(roomId, eventId, serverOrigin) {
         if (!window.__TAURI_INTERNALS__) return;
-        var url, body;
+        var path, body;
         if (eventId) {
-            url = '/api/connect/chatto.api.v1.RoomService/GetRoomEventsAround';
+            path = '/api/connect/chatto.api.v1.RoomService/GetRoomEventsAround';
             body = { roomId: roomId, eventId: eventId, limit: 1 };
         } else {
-            url = '/api/connect/chatto.api.v1.RoomService/GetRoomEvents';
+            path = '/api/connect/chatto.api.v1.RoomService/GetRoomEvents';
             body = { roomId: roomId, limit: 1 };
         }
-        fetch(url, {
+
+        var base = serverOrigin || window.location.origin;
+        var isOrigin = base === window.location.origin;
+        var token = isOrigin ? null : __chattoTokenForOrigin(base);
+        // A remote server needs its per-server bearer token. Without it we cannot
+        // hydrate, and firing a relative request would hit the origin with the
+        // wrong auth, so skip.
+        if (!isOrigin && !token) return;
+
+        var url = isOrigin ? path : (base + path);
+        var headers = {'Content-Type': 'application/json'};
+        var fetchOpts = {
             method: 'POST',
-            credentials: 'include',
-            headers: {'Content-Type': 'application/json'},
+            headers: headers,
             body: JSON.stringify(body)
-        })
+        };
+        if (isOrigin) {
+            fetchOpts.credentials = 'include';
+        } else {
+            headers['Authorization'] = 'Bearer ' + token;
+        }
+
+        fetch(url, fetchOpts)
         .then(function(r) { return r.json(); })
         .then(function(data) {
             var page = data && data.page;
@@ -201,14 +257,18 @@ const NOTIFICATION_BRIDGE_JS: &str = r#"
         function PatchedWebSocket(url, protocols) {
             var ws = protocols !== undefined ? new _WS(url, protocols) : new _WS(url);
             if (typeof url === 'string' && url.indexOf('/api/realtime') !== -1) {
+                // Capture which server this socket talks to, so notification
+                // frames from a remote server hydrate against that server,
+                // not always the origin host.
+                var wsOrigin = __chattoWsHttpOrigin(url);
                 ws.addEventListener('message', function(ev) {
                     try {
                         var data = ev.data;
                         if (data instanceof ArrayBuffer) {
-                            __chattoHandleFrame(new Uint8Array(data));
+                            __chattoHandleFrame(new Uint8Array(data), wsOrigin);
                         } else if (typeof Blob !== 'undefined' && data instanceof Blob) {
                             data.arrayBuffer().then(function(ab) {
-                                try { __chattoHandleFrame(new Uint8Array(ab)); } catch(_) {}
+                                try { __chattoHandleFrame(new Uint8Array(ab), wsOrigin); } catch(_) {}
                             });
                         }
                     } catch(_) {}
