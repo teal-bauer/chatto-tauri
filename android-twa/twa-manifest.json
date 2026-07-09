@@ -12,6 +12,7 @@
   "navigationDividerColor": "#e5e7eb",
   "navigationDividerColorDark": "#111827",
   "backgroundColor": "#f3f4f6",
+  "splashScreenFadeOutDuration": 300,
   "enableNotifications": true,
   "startUrl": "/",
   "iconUrl": "https://chat.chatto.run/icons/icon-512.png",
