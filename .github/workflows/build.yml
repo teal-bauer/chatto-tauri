@@ -9,9 +9,10 @@ on:
   workflow_dispatch:
 
 jobs:
-  # Guard: the release workflow derives the release tag from the app version
-  # (tauri-action tagName v__VERSION__), so a tag that doesn't match the version
-  # would build against, and clobber, a different release. Fail fast instead.
+  # The release is created for the pushed tag (tauri-action tagName below), but
+  # the built artifacts embed the version from tauri.conf.json / Cargo.toml. Fail
+  # fast if those don't match the tag, so a release can never ship binaries
+  # labeled with the wrong version.
   check-version:
     runs-on: ubuntu-latest
     steps:
@@ -114,8 +115,8 @@ jobs:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         with:
-          tagName: v__VERSION__
-          releaseName: 'Chatto v__VERSION__'
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Chatto ${{ github.ref_name }}'
           releaseBody: ''
           releaseDraft: true
           prerelease: false
@@ -205,10 +206,6 @@ jobs:
             --ks-pass pass:android --key-pass pass:android \
             "$apk"
 
-      - name: Get version
-        id: version
-        run: echo "version=$(jq -r .version src-tauri/tauri.conf.json)" >> "$GITHUB_OUTPUT"
-
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
@@ -271,8 +268,13 @@ jobs:
           [ -n "$fixes" ] && body+="## Fixes"$'\n'"$fixes"$'\n\n'
           body+="**Full changelog**: https://github.com/${{ github.repository }}/compare/${prev_tag}...${tag}"
 
-          release_id=$(gh api repos/${{ github.repository }}/releases \
-            --jq '[.[] | select(.draft)] | first | .id')
+          # Select the draft for THIS tag, not just any draft. The tags API
+          # doesn't return drafts, so filter the list by tag_name.
+          release_id=$(TAG="$tag" gh api repos/${{ github.repository }}/releases \
+            --jq '[.[] | select(.draft and .tag_name==env.TAG)] | first | .id')
+          if [ -z "$release_id" ] || [ "$release_id" = "null" ]; then
+            echo "::error::no draft release found for tag $tag"; exit 1
+          fi
           gh api --method PATCH repos/${{ github.repository }}/releases/$release_id \
             -f body="$body"
         env:
