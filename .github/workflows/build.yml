@@ -9,7 +9,34 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Guard: the release workflow derives the release tag from the app version
+  # (tauri-action tagName v__VERSION__), so a tag that doesn't match the version
+  # would build against, and clobber, a different release. Fail fast instead.
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          want="${tag#v}"
+          tv=$(jq -r .version src-tauri/tauri.conf.json)
+          pv=$(jq -r .version package.json)
+          cv=$(grep -m1 '^version = ' src-tauri/Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          fail=0
+          for pair in "tauri.conf.json=$tv" "package.json=$pv" "Cargo.toml=$cv"; do
+            f="${pair%%=*}"; got="${pair#*=}"
+            if [ "$got" != "$want" ]; then
+              echo "::error::$f is $got, expected $want (tag $tag); bump the version before tagging"
+              fail=1
+            fi
+          done
+          if [ "$fail" = 0 ]; then echo "All versions match $tag"; fi
+          exit $fail
+
   build:
+    needs: check-version
     permissions:
       contents: write
     strategy:
@@ -118,6 +145,7 @@ jobs:
           path: src-tauri/target/**/release/bundle/**
 
   build-android:
+    needs: check-version
     permissions:
       contents: write
     runs-on: ubuntu-latest
