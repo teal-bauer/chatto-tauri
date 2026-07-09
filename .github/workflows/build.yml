@@ -224,8 +224,19 @@ jobs:
           prev_tag=$(git describe --tags --abbrev=0 "${tag}^" 2>/dev/null || echo "")
           range="${prev_tag:+${prev_tag}..}${tag}"
 
-          feats=$(git log "$range" --pretty=format:"%s" | grep "^feat" | sed 's/^feat[^:]*: /- /')
-          fixes=$(git log "$range" --pretty=format:"%s" | grep "^fix"  | sed 's/^fix[^:]*: /- /')
+          # Keep user-facing notes clean: drop dev-facing scopes, and let any
+          # commit opt out with "[skip changelog]" in its subject.
+          internal='build|ci|deps|dev|test|internal|release|repo|chore'
+          collect() {
+            git log "$range" --no-merges --pretty=format:"%s" \
+              | grep -E "^$1" \
+              | grep -vE "^$1\((${internal})\)" \
+              | grep -vF '[skip changelog]' \
+              | sed -E "s/^$1(\([^)]*\))?!?: /- /"
+          }
+
+          feats=$(collect feat)
+          fixes=$(collect fix)
 
           body=""
           [ -n "$feats" ] && body+="## What's new"$'\n'"$feats"$'\n\n'
