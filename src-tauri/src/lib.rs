@@ -367,6 +367,118 @@ const KEYBOARD_VIEWPORT_SHIM_JS: &str = r#"
 })();
 "#;
 
+// Keeps the emoji-reaction bottom sheet (a native <dialog> opened via
+// showModal()) open when Android's soft keyboard fires a spurious dialog
+// close. Tapping the emoji search input inside the sheet raises the IME,
+// and the WebView delivers a 'cancel' (which the web app already guards)
+// followed sometimes by a non-cancelable 'close' the app does NOT guard,
+// so the whole sheet gets dismissed. We reproduce the same guard generically
+// at the document level, for any <dialog>, without coupling to Chatto's CSS.
+//
+// The key discriminator: the app only ever calls
+// HTMLDialogElement.prototype.close() to dismiss a dialog on purpose (emoji
+// picked, backdrop tapped, Escape, etc). The Android-engine-initiated close
+// that rides along with the IME does not go through that method. So we
+// monkeypatch close() to leave a breadcrumb, and treat any 'close' event
+// that arrives without that breadcrumb, during the keyboard focus race
+// window, as spurious and reopen the dialog.
+#[cfg(target_os = "android")]
+const DIALOG_KEYBOARD_GUARD_JS: &str = r#"
+(function() {
+    if (window.__chattoDialogKbdGuard) return;
+    window.__chattoDialogKbdGuard = true;
+
+    var proto = window.HTMLDialogElement && window.HTMLDialogElement.prototype;
+    if (!proto) return;
+
+    // Mark intentional closes so the 'close' handler below can tell them
+    // apart from the engine-initiated ones the Android IME triggers.
+    var origClose = proto.close;
+    proto.close = function() {
+        this.__chattoIntentionalClose = true;
+        return origClose.apply(this, arguments);
+    };
+
+    // How long after focusing an input inside an open dialog we still treat
+    // a close event as keyboard-related. Covers the gap between the IME
+    // animating in and the WebView firing its spurious cancel/close pair.
+    var KEYBOARD_RACE_MS = 1000;
+    var lastDialogInput = null;
+    var lastDialogInputAt = 0;
+
+    function raceActive() {
+        return (Date.now() - lastDialogInputAt) < KEYBOARD_RACE_MS;
+    }
+
+    function isTextInput(el) {
+        if (!el) return false;
+        if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') return true;
+        return !!(el.isContentEditable);
+    }
+
+    // Track the focused input any time focus lands inside an open dialog,
+    // so we know both when the keyboard race window is active and which
+    // element to restore focus to if we have to reopen.
+    document.addEventListener('focusin', function(e) {
+        var t = e.target;
+        if (!isTextInput(t)) return;
+        var dialog = t.closest && t.closest('dialog');
+        if (!dialog || !dialog.open) return;
+        lastDialogInput = t;
+        lastDialogInputAt = Date.now();
+    }, true);
+
+    // Swallow the first spurious event of the pair: a 'cancel' fired by the
+    // WebView while the keyboard race is active (or while a dialog input is
+    // still focused). Harmless if the app already prevents it too.
+    document.addEventListener('cancel', function(e) {
+        var d = e.target;
+        if (!(d instanceof HTMLDialogElement)) return;
+        var active = document.activeElement;
+        var activeInsideDialog = isTextInput(active) && d.contains(active);
+        if (raceActive() || activeInsideDialog) {
+            e.preventDefault();
+        }
+    }, true);
+
+    // Catch the second, non-preventable event of the pair: a 'close' that
+    // actually dismissed the dialog. Reopen it if it wasn't an intentional
+    // app-initiated close and we're still inside the keyboard race window.
+    document.addEventListener('close', function(e) {
+        var d = e.target;
+        if (!(d instanceof HTMLDialogElement)) return;
+
+        if (d.__chattoIntentionalClose) {
+            // The app closed this on purpose (emoji picked, backdrop tap,
+            // Escape...). Clear the flag and leave it closed.
+            d.__chattoIntentionalClose = false;
+            return;
+        }
+
+        if (!raceActive()) {
+            // Not keyboard-related; this is a safety valve so we never trap
+            // a dialog the user is legitimately trying to dismiss.
+            return;
+        }
+
+        requestAnimationFrame(function() {
+            if (d.open) return;
+            try {
+                d.showModal();
+            } catch (_) {
+                return;
+            }
+            // showModal() moves focus to the dialog itself; restore focus to
+            // the input the user was typing in so the soft keyboard the tap
+            // summoned stays up instead of dismissing on the refocus.
+            if (lastDialogInput && d.contains(lastDialogInput)) {
+                try { lastDialogInput.focus(); } catch (_) {}
+            }
+        });
+    }, true);
+})();
+"#;
+
 #[cfg(target_os = "android")]
 const ACTIVE_ROOM_TRACKER_JS: &str = r#"
 (function() {
@@ -1188,6 +1300,7 @@ fn create_main_window(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>
     #[cfg(target_os = "android")]
     let builder = builder
         .initialization_script(KEYBOARD_VIEWPORT_SHIM_JS)
+        .initialization_script(DIALOG_KEYBOARD_GUARD_JS)
         .initialization_script(ACTIVE_ROOM_TRACKER_JS);
 
     #[cfg(desktop)]
