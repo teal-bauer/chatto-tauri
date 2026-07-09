@@ -61,7 +61,7 @@ const NOTIFICATION_BRIDGE_JS: &str = r#"
 
     // Deduplication: track recently fired notifications by event_id (fallback
     // notification_id) to avoid firing twice when multiple sockets deliver the
-    // same event. Keying on the event id — not roomId — so distinct rapid
+    // same event. Keying on the event id, not roomId, so distinct rapid
     // messages in the same room are not wrongly dropped.
     var __chattoRecentNotifKeys = {};
     function __chattoShouldFire(key) {
@@ -74,7 +74,7 @@ const NOTIFICATION_BRIDGE_JS: &str = r#"
         return true;
     }
 
-    // --- Minimal hand-rolled protobuf field walker ---------------------------
+    // Minimal hand-rolled protobuf field walker
     // The realtime socket speaks binary protobuf. We only need to reach a few
     // fields, so walk the wire format directly instead of pulling in a codec.
     // wire types: 0=VARINT, 1=I64, 2=LEN, 5=I32. Field/length varints are small
@@ -112,7 +112,7 @@ const NOTIFICATION_BRIDGE_JS: &str = r#"
     }
     function __pbStr(buf, f) { return (f && f.wire === 2) ? __pbDecodeUtf8(buf, f.start, f.end) : null; }
 
-    // Decode a RealtimeServerFrame → RealtimeEventEnvelope → notification_created.
+    // Decode a RealtimeServerFrame -> RealtimeEventEnvelope -> notification_created.
     function __chattoHandleFrame(buf) {
         // On Android the native NotificationService owns the background path;
         // firing here too would double up.
@@ -178,7 +178,7 @@ const NOTIFICATION_BRIDGE_JS: &str = r#"
             }
             var msg = anchor && anchor.messagePosted && anchor.messagePosted.message;
             var text = msg && msg.body;
-            if (!text) return; // not a chat message (join/leave/etc.) — suppress
+            if (!text) return; // not a chat message (join/leave/etc.), suppress
             var actorId = (msg && msg.actorId) || (anchor && anchor.actorId);
             var title = 'Chatto';
             var users = page.includes && page.includes.users;
@@ -224,7 +224,7 @@ const NOTIFICATION_BRIDGE_JS: &str = r#"
         window.WebSocket = PatchedWebSocket;
     })();
 
-    // Keep Notification API mock for compatibility — reported as granted so
+    // Keep Notification API mock for compatibility, reported as granted so
     // the web app does not prompt the user for permission.
     window.Notification = function(title, options) {
         if (window.__TAURI_INTERNALS__) {
@@ -379,7 +379,7 @@ const ACTIVE_ROOM_TRACKER_JS: &str = r#"
         // ends the path or precedes the next slash.
         var m = window.location.pathname.match(/^\/chat\/(?:[^\/]+\/)?([^\/?#]+)/);
         var roomId = m ? m[1] : '';
-        // Call Android JavascriptInterface directly — no Rust IPC needed
+        // Call Android JavascriptInterface directly, no Rust IPC needed
         if (window.ChattoAndroid && window.ChattoAndroid.setActiveRoom) {
             window.ChattoAndroid.setActiveRoom(roomId);
         }
@@ -441,7 +441,7 @@ const EXTERNAL_LINK_JS: &str = r#"
 
     var serverHost = window.location.hostname;
     // Updated by check_instance_flow on page load. While true, the page is on a
-    // FOREIGN host (an OIDC provider mid-flow) — keep every link inside the
+    // FOREIGN host (an OIDC provider mid-flow), keep every link inside the
     // webview so the redirect chain can complete and land back on the origin.
     var inInstanceFlow = false;
 
@@ -550,7 +550,7 @@ fn set_server_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
             }
             Err(ureq::Error::Transport(e)) => {
                 let reason = match e.kind() {
-                    ureq::ErrorKind::Dns => "Server not found — check the address",
+                    ureq::ErrorKind::Dns => "Server not found, check the address",
                     ureq::ErrorKind::ConnectionFailed => "Could not connect to server",
                     ureq::ErrorKind::Io => "Connection error",
                     _ => "Server unreachable",
@@ -600,7 +600,7 @@ fn check_instance_flow(url: String) -> Result<bool, String> {
     let configured = CONFIGURED_ORIGIN_HOST.lock().map_err(|e| e.to_string())?;
     Ok(match configured.as_deref() {
         Some(origin) => host != origin,
-        // Origin unknown (window not built yet) — default to externalizing.
+        // Origin unknown (window not built yet), default to externalizing.
         None => false,
     })
 }
@@ -766,7 +766,7 @@ async fn do_update_check(app: tauri::AppHandle, silent: bool) {
                     .builder()
                     .title("Chatto update available")
                     .body(&format!(
-                        "v{} is ready — use Chatto > Check for Updates to install",
+                        "v{} is ready, use Chatto > Check for Updates to install",
                         update.version
                     ))
                     .show();
@@ -1203,7 +1203,7 @@ fn create_main_window(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>
                 let _ = window.set_title(&title);
             })
             .on_navigation(move |_url| {
-                // Allow all navigations — EXTERNAL_LINK_JS handles opening
+                // Allow all navigations, EXTERNAL_LINK_JS handles opening
                 // external links in the system browser for user-initiated clicks.
                 // Intercepting here breaks iframe embeds (YouTube, etc.) because
                 // on_navigation fires for subframe loads too.

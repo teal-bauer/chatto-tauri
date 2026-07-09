@@ -98,7 +98,7 @@
     try {
       await invoke("set_server_url", { url });
       hasOverride = true;
-      // The webview will navigate to the server URL — this UI disappears
+      // The webview will navigate to the server URL, this UI disappears
     } catch (e) {
       error = `${e}`;
       connecting = false;
@@ -165,7 +165,7 @@
     installingUpdate = true;
     try {
       await invoke("install_update");
-      // App restarts to apply the update — no further state change needed.
+      // App restarts to apply the update, no further state change needed.
     } catch (e) {
       error = `Failed to install update: ${e}`;
       installingUpdate = false;

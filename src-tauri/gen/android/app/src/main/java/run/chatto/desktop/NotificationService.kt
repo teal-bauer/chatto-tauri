@@ -24,10 +24,9 @@ import java.util.concurrent.TimeUnit
 /**
  * Foreground service that keeps a binary-protobuf realtime WebSocket open
  * (wss://<host>/api/realtime) so notifications arrive while the app is
- * backgrounded. Decodes RealtimeServerFrame.event → RealtimeEventEnvelope →
+ * backgrounded. Decodes RealtimeServerFrame.event -> RealtimeEventEnvelope ->
  * RealtimeNotificationCreatedEvent with a tiny hand-rolled protobuf reader, then
- * hydrates the message body over ConnectRPC JSON. This replaces the retired
- * GraphQL/graphql-transport-ws/myInstanceEvents scheme.
+ * hydrates the message body over ConnectRPC JSON.
  */
 class NotificationService : Service() {
 
@@ -48,7 +47,7 @@ class NotificationService : Service() {
         //     field 2 (subscribe_events, LEN) tag=0x12 len=0x00
         private val FRAME_SUBSCRIBE = byteArrayOf(0x12, 0x00)
 
-        /** Current room the user is viewing — suppress notifications for this room */
+        /** Current room the user is viewing, suppress notifications for this room */
         @Volatile
         var activeRoomId: String? = null
 
@@ -150,7 +149,7 @@ class NotificationService : Service() {
             .build()
     }
 
-    // --- Config store (Tauri's config.json) ---
+    // Config store (Tauri's config.json)
 
     /** First readable Tauri store file, or null. */
     private fun readConfig(): JSONObject? {
@@ -189,7 +188,7 @@ class NotificationService : Service() {
         return try {
             val cm = CookieManager.getInstance()
             // The WebView may not have flushed cookies to the persistent store
-            // yet — flush before reading so freshly-set session cookies are
+            // yet, flush before reading so freshly-set session cookies are
             // visible to this service.
             cm.flush()
             val cookies = cm.getCookie(serverUrl)
@@ -208,7 +207,7 @@ class NotificationService : Service() {
         }
     }
 
-    // --- WebSocket Connection ---
+    // WebSocket Connection
 
     private fun connectIfNeeded() {
         if (isConnected) return
@@ -216,7 +215,7 @@ class NotificationService : Service() {
         val serverUrl = getServerUrl()
         val cookies = getCookies(serverUrl)
         if (cookies.isNullOrBlank()) {
-            Log.w(TAG, "No cookies available — user may not be logged in. Retrying later.")
+            Log.w(TAG, "No cookies available, user may not be logged in. Retrying later.")
             scheduleReconnect()
             return
         }
@@ -288,7 +287,7 @@ class NotificationService : Service() {
         }
     }
 
-    // --- Minimal protobuf reader ---
+    // Minimal protobuf reader
 
     /**
      * Walks a protobuf message field by field. Only the two wire types we need
@@ -345,12 +344,12 @@ class NotificationService : Service() {
                 2 -> { val len = readVarint().toInt().coerceIn(0, end - pos); pos += len }
                 1 -> pos = minOf(end, pos + 8)
                 5 -> pos = minOf(end, pos + 4)
-                else -> pos = end // unknown wire type — bail out of this message
+                else -> pos = end // unknown wire type, bail out of this message
             }
         }
     }
 
-    // --- Frame decoding ---
+    // Frame decoding
 
     /** Top-level RealtimeServerFrame oneof. */
     private fun handleServerFrame(ws: WebSocket, data: ByteArray) {
@@ -376,7 +375,7 @@ class NotificationService : Service() {
         eventBytes?.let { decodeEnvelope(it) }
     }
 
-    /** RealtimeEventEnvelope — we only care about field 60 (notification_created). */
+    /** RealtimeEventEnvelope, we only care about field 60 (notification_created). */
     private fun decodeEnvelope(data: ByteArray) {
         val r = ProtoReader(data)
         var envelopeId: String? = null
@@ -386,7 +385,7 @@ class NotificationService : Service() {
             when {
                 field == 1 && r.wireType == 2 -> envelopeId = r.readString()       // envelope id
                 field == 60 && r.wireType == 2 -> notifBytes = r.readLenBytes()    // notification_created
-                else -> r.skipValue() // other event kinds (message_posted, mention, ...) — ignore
+                else -> r.skipValue() // other event kinds (message_posted, mention, ...), ignore
             }
         }
         val nb = notifBytes ?: return // key ONLY on notification_created (avoids double-firing)
@@ -394,7 +393,7 @@ class NotificationService : Service() {
         decodeNotificationCreated(nb)
     }
 
-    /** RealtimeNotificationCreatedEvent → decision logic + hydration. */
+    /** RealtimeNotificationCreatedEvent -> decision logic + hydration. */
     private fun decodeNotificationCreated(data: ByteArray) {
         val r = ProtoReader(data)
         var notificationId: String? = null
@@ -424,7 +423,7 @@ class NotificationService : Service() {
         fetchRoomEventAndNotify(room, ev)
     }
 
-    // --- Notification Deduplication ---
+    // Notification Deduplication
 
     private fun shouldFire(key: String): Boolean {
         val now = System.currentTimeMillis()
@@ -438,7 +437,7 @@ class NotificationService : Service() {
         return true
     }
 
-    // --- Hydrate message via ConnectRPC JSON ---
+    // Hydrate message via ConnectRPC JSON
 
     private fun buildDeepLink(serverUrl: String, roomId: String, eventId: String?): String {
         // The "-" is the literal home-server segment (HOME_SEGMENT), required.
@@ -543,13 +542,13 @@ class NotificationService : Service() {
 
         val messagePosted = messagePostedOf(anchor)
         if (messagePosted == null) {
-            // Not a chat message (join/leave/room event) — nothing to show.
+            // Not a chat message (join/leave/room event), nothing to show.
             if (BuildConfig.DEBUG) Log.d(TAG, "No messagePosted in anchor, suppressing")
             return
         }
         val message = messagePosted.optJSONObject("message")
         val msgBody = message?.optString("body", "")?.takeIf { it.isNotBlank() }
-        if (msgBody == null) return // no body → suppress (matches old behavior)
+        if (msgBody == null) return // not a chat message, nothing to show
 
         val actorId = message.optString("actorId", "").takeIf { it.isNotBlank() }
             ?: anchor?.optString("actorId", "")?.takeIf { it.isNotBlank() }
@@ -563,7 +562,7 @@ class NotificationService : Service() {
         showMessageNotification(displayName ?: "Chatto", msgBody, deepLink)
     }
 
-    // --- Show Notification ---
+    // Show Notification
 
     private var notifCounter = 100
 

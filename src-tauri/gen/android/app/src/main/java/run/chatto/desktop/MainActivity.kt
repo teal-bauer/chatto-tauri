@@ -43,7 +43,7 @@ class MainActivity : TauriActivity() {
     installSplashScreen()
     super.onCreate(savedInstanceState)
 
-    // True edge-to-edge — required on Android 15+ (SDK 35+) and the modern
+    // True edge-to-edge, required on Android 15+ (SDK 35+) and the modern
     // recommended pattern. The system bars are transparent; we resize the
     // WebView via margins so its layout viewport (and any position:fixed
     // children) stays inside the safe area.
@@ -121,8 +121,8 @@ class MainActivity : TauriActivity() {
     // Forward system-bar + IME insets to JS, and resize the WebView to the
     // safe area via layout margins. Bottom margin is max(systemBars, IME) so
     // that:
-    //   - keyboard hidden → bottom margin = gesture handle height
-    //   - keyboard shown  → bottom margin = keyboard height (which already
+    //   - keyboard hidden -> bottom margin = gesture handle height
+    //   - keyboard shown  -> bottom margin = keyboard height (which already
     //     subsumes the gesture handle)
     // The page never has to know about either; position:fixed bottom elements
     // stay visible above whatever is taking up the bottom of the screen.
@@ -181,7 +181,7 @@ class MainActivity : TauriActivity() {
       """.trimIndent()
       wv?.evaluateJavascript(js, null)
 
-      // Consume the system bar insets — children don't need them since we've
+      // Consume the system bar insets, children don't need them since we've
       // already moved out of their reach. Pass IME through.
       WindowInsetsCompat.Builder(insets)
         .setInsets(WindowInsetsCompat.Type.systemBars(), androidx.core.graphics.Insets.NONE)

@@ -4,7 +4,7 @@
         <item name="android:windowBackground">@color/chatto_background_dark</item>
     </style>
 
-    <!-- Dark-mode launch splash — same structure as the light variant. -->
+    <!-- Dark-mode launch splash, same structure as the light variant. -->
     <style name="Theme.chatto_desktop.Splash" parent="Theme.SplashScreen">
         <item name="windowSplashScreenBackground">@color/chatto_background_dark</item>
         <item name="windowSplashScreenAnimatedIcon">@drawable/ic_splash</item>
