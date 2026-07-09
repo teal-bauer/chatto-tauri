@@ -1,11 +1,11 @@
-name: Desktop App Issue
-description: Report a bug or request a feature for the Chatto desktop app
+name: App Issue
+description: Report a bug or request a feature for the Chatto desktop or Android app
 labels: []
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for reporting an issue with Chatto Desktop! Please fill out the details below.
+        Thanks for reporting an issue with the Chatto app! Please fill out the details below.
   - type: dropdown
     id: type
     attributes:
@@ -24,14 +24,15 @@ body:
         - macOS (Intel)
         - Windows
         - Linux
+        - Android
     validations:
       required: true
   - type: input
     id: version
     attributes:
       label: App version
-      description: Shown in Chatto > About Chatto
-      placeholder: v0.1.0
+      description: "Desktop: Chatto > About Chatto. Android: App Settings."
+      placeholder: v0.5.0
     validations:
       required: true
   - type: textarea
