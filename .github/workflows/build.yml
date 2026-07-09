@@ -95,20 +95,21 @@ jobs:
           includeUpdaterJson: true
           args: ${{ matrix.args }}
 
+      # No-release builds (main pushes and PRs) skip updater artifacts. Signing
+      # them needs TAURI_SIGNING_PRIVATE_KEY, which fork PRs can't access, and
+      # updater artifacts are only shipped from tag builds anyway.
       - name: Build (no release)
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         with:
-          args: ${{ matrix.args }}
+          args: ${{ matrix.args }} --config ${{ github.workspace }}/.github/pr-build.conf.json
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
