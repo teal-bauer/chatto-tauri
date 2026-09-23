@@ -172,7 +172,9 @@ jobs:
           cache: gradle
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        # v4.0.2+ handles the removed legacy `tools` package; sdkmanager no
+        # longer offers it, which fails v3's install step outright.
+        uses: android-actions/setup-android@v4
 
       - name: Install Android NDK
         run: sdkmanager "ndk;28.0.13004108"
