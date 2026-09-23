@@ -981,6 +981,14 @@ fn set_autostart_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(), Str
     }
 }
 
+// How often a running app re-checks for updates. Launch already checks once
+// (see setup), but close-to-tray sessions can outlive that by weeks, so the
+// periodic re-check keeps them from being stuck on an old version until the
+// next manual start.
+#[cfg(desktop)]
+const UPDATE_CHECK_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
 // Query the update endpoint. Shared by the menu-driven check, the startup
 // silent check, and the check_update/install_update IPC commands.
 #[cfg(desktop)]
@@ -1606,6 +1614,20 @@ pub fn run() {
             {
                 let update_handle = app.handle().clone();
                 tauri::async_runtime::spawn(do_update_check(update_handle, true));
+            }
+
+            // Quiet weekly re-check so a long-lived session (close-to-tray
+            // apps can run for weeks) learns about a new version without
+            // waiting for the next launch. Sleeps on its own thread so no
+            // async runtime worker is blocked; each check hops onto the
+            // runtime via block_on.
+            #[cfg(desktop)]
+            {
+                let update_handle = app.handle().clone();
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(UPDATE_CHECK_INTERVAL);
+                    tauri::async_runtime::block_on(do_update_check(update_handle.clone(), true));
+                });
             }
 
             Ok(())
