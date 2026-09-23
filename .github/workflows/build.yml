@@ -8,6 +8,17 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Serialize whole runs of this workflow: a branch build and a tag build of
+# the same version race tauri-action over the release draft, and each side's
+# tagName overwrites the other's. Cross-run ordering can't be expressed with
+# `needs`, so runs queue in a single group instead. Push the version-bump
+# commit before its tag so the tag build executes (and finishes) last. A
+# queued run replaces older queued runs, and an in-flight build is never
+# cancelled -- cancelling mid-release would leave a broken release state.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 jobs:
   # The release is created for the pushed tag (tauri-action tagName below), but
   # the built artifacts embed the version from tauri.conf.json / Cargo.toml. Fail
