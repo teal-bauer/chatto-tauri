@@ -137,18 +137,49 @@ jobs:
       # No-release builds (main pushes and PRs) skip updater artifacts. Signing
       # them needs TAURI_SIGNING_PRIVATE_KEY, which fork PRs can't access, and
       # updater artifacts are only shipped from tag builds anyway.
-      - name: Build (no release)
-        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-        uses: tauri-apps/tauri-action@v0
+      # Tag builds keep tauri-action, which owns certificate import and release
+      # upload there. Branch builds call the Tauri CLI directly so they never
+      # create or modify a GitHub release (tauri-action's release handling is
+      # exactly what races tag builds over the release draft); this step
+      # reproduces the signing setup tauri-action would have done. Every guard
+      # falls back to an unsigned build when secrets are unavailable (fork PRs).
+      - name: Prepare macOS signing (no release)
+        if: ${{ matrix.platform == 'macos-latest' && !startsWith(github.ref, 'refs/tags/v') }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-        with:
-          args: ${{ matrix.args }} --config ${{ github.workspace }}/.github/pr-build.conf.json
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            echo "::warning::APPLE_CERTIFICATE unavailable (fork PR?); building unsigned"
+          else
+            printf '%s' "$APPLE_CERTIFICATE" | base64 -d > "$RUNNER_TEMP/cert.p12"
+            security create-keychain -p actions build.keychain
+            security default-keychain -s build.keychain
+            security unlock-keychain -p actions build.keychain
+            security set-keychain-settings -t 3600 -u build.keychain
+            security import "$RUNNER_TEMP/cert.p12" -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -k actions build.keychain
+            security find-identity -v -p codesigning build.keychain
+            rm "$RUNNER_TEMP/cert.p12"
+            if [ -n "$APPLE_SIGNING_IDENTITY" ]; then
+              echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
+            fi
+          fi
+          # Notarization credentials for the Tauri CLI; APPLE_API_KEY_PATH is
+          # exported by the Stage Apple API key step above.
+          if [ -n "$APPLE_API_ISSUER" ] && [ -n "$APPLE_API_KEY" ]; then
+            echo "APPLE_API_ISSUER=$APPLE_API_ISSUER" >> "$GITHUB_ENV"
+            echo "APPLE_API_KEY=$APPLE_API_KEY" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build (no release)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        # Plain tauri build on the pr-build config (updater artifacts off).
+        # Signing/notarization envs arrive via GITHUB_ENV on macOS only.
+        run: pnpm tauri build ${{ matrix.args }} --config ${{ github.workspace }}/.github/pr-build.conf.json
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
