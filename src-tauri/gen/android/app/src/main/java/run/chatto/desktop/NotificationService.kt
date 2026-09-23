@@ -24,9 +24,10 @@ import java.util.concurrent.TimeUnit
 /**
  * Foreground service that keeps a binary-protobuf realtime WebSocket open
  * (wss://<host>/api/realtime) so notifications arrive while the app is
- * backgrounded. Decodes RealtimeServerFrame.event -> RealtimeEventEnvelope ->
- * RealtimeNotificationCreatedEvent with a tiny hand-rolled protobuf reader, then
- * hydrates the message body over ConnectRPC JSON.
+ * backgrounded. Decodes RealtimeServerFrame.event -> RealtimeEvent ->
+ * NotificationOccurrencesChangedEvent with a tiny hand-rolled protobuf
+ * reader, resolves the occurrence to its room/message over ConnectRPC JSON,
+ * then hydrates the message body the same way.
  */
 class NotificationService : Service() {
 
@@ -38,14 +39,14 @@ class NotificationService : Service() {
         private const val DEFAULT_SERVER_URL = "https://chat.chatto.run"
         private const val MAX_RECONNECT_DELAY_MS = 60_000L
 
-        // Static client frames (see REALTIME_SPEC.md). Both are trivially small,
-        // so we ship the exact bytes rather than a general encoder:
-        //   RealtimeClientFrame.hello{ protocol_version = 1 }
-        //     field 1 (hello, LEN) tag=0x0A len=0x02 -> [ field 1 (uint32, VARINT) tag=0x08 value=0x01 ]
-        private val FRAME_HELLO = byteArrayOf(0x0A, 0x02, 0x08, 0x01)
-        //   RealtimeClientFrame.subscribe_events{} (empty message)
-        //     field 2 (subscribe_events, LEN) tag=0x12 len=0x00
-        private val FRAME_SUBSCRIBE = byteArrayOf(0x12, 0x00)
+        // One static client frame, small enough to
+        // ship as exact bytes rather than a general encoder:
+        //   RealtimeSubscribe{ protocol_version = 4, initial_state = LIVE_ONLY }
+        //     field 1 (protocol_version, VARINT): tag=0x08 value=0x04
+        //     field 4 (initial_state,     VARINT): tag=0x20 value=0x01
+        // Auth rides on the Cookie header of the upgrade request; the bearer
+        // token field is optional and omitted here.
+        private val FRAME_SUBSCRIBE = byteArrayOf(0x08, 0x04, 0x20, 0x01)
 
         /** Current room the user is viewing, suppress notifications for this room */
         @Volatile
@@ -65,7 +66,6 @@ class NotificationService : Service() {
     private var webSocket: WebSocket? = null
     private var reconnectAttempt = 0
     private var isConnected = false
-    private var handshakeDone = false
     private val recentNotifKeys = mutableMapOf<String, Long>()
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -231,7 +231,6 @@ class NotificationService : Service() {
             .pingInterval(30, TimeUnit.SECONDS)
             .build()
 
-        handshakeDone = false
         val request = Request.Builder()
             .url(wsUrl)
             .header("Cookie", cookies)
@@ -255,14 +254,13 @@ class NotificationService : Service() {
             if (BuildConfig.DEBUG) Log.d(TAG, "WebSocket opened")
             isConnected = true
             reconnectAttempt = 0
-            handshakeDone = false
-            // Step 1 of the handshake: send RealtimeClientFrame.hello.
-            webSocket.send(FRAME_HELLO.toByteString())
+            // The only client message: one RealtimeSubscribe.
+            webSocket.send(FRAME_SUBSCRIBE.toByteString())
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
             try {
-                handleServerFrame(webSocket, bytes.toByteArray())
+                handleServerFrame(bytes.toByteArray())
             } catch (e: Exception) {
                 if (BuildConfig.DEBUG) Log.w(TAG, "Failed to handle frame: ${e.message}")
             }
@@ -352,75 +350,114 @@ class NotificationService : Service() {
     // Frame decoding
 
     /** Top-level RealtimeServerFrame oneof. */
-    private fun handleServerFrame(ws: WebSocket, data: ByteArray) {
+    private fun handleServerFrame(data: ByteArray) {
         val r = ProtoReader(data)
-        var hasHello = false
         var eventBytes: ByteArray? = null
         while (r.hasMore()) {
             val field = r.nextField()
             when {
-                field == 1 && r.wireType == 2 -> { hasHello = true; r.readLenBytes() } // hello
-                field == 3 && r.wireType == 2 -> eventBytes = r.readLenBytes()          // event
-                else -> r.skipValue() // heartbeat / pong / error / close / subscribed / unknown
+                field == 1 && r.wireType == 2 -> eventBytes = r.readLenBytes() // event
+                else -> r.skipValue() // heartbeat / close / caught_up / snapshot / unknown
             }
         }
-
-        if (hasHello && !handshakeDone) {
-            // Step 2 of the handshake: subscribe to events.
-            handshakeDone = true
-            ws.send(FRAME_SUBSCRIBE.toByteString())
-            if (BuildConfig.DEBUG) Log.d(TAG, "Server hello received, subscribed to events")
-        }
-
-        eventBytes?.let { decodeEnvelope(it) }
+        eventBytes?.let { decodeEvent(it) }
     }
 
-    /** RealtimeEventEnvelope, we only care about field 60 (notification_created). */
-    private fun decodeEnvelope(data: ByteArray) {
+    /** RealtimeEvent, we only care about notification_occurrences_changed (field 56). */
+    private fun decodeEvent(data: ByteArray) {
         val r = ProtoReader(data)
-        var envelopeId: String? = null
-        var notifBytes: ByteArray? = null
+        var hintBytes: ByteArray? = null
         while (r.hasMore()) {
             val field = r.nextField()
             when {
-                field == 1 && r.wireType == 2 -> envelopeId = r.readString()       // envelope id
-                field == 60 && r.wireType == 2 -> notifBytes = r.readLenBytes()    // notification_created
-                else -> r.skipValue() // other event kinds (message_posted, mention, ...), ignore
+                field == 56 && r.wireType == 2 -> hintBytes = r.readLenBytes() // notification hint
+                else -> r.skipValue() // other event kinds (message_posted, typing, ...), ignore
             }
         }
-        val nb = notifBytes ?: return // key ONLY on notification_created (avoids double-firing)
-        if (BuildConfig.DEBUG) Log.d(TAG, "notification_created envelope=$envelopeId")
-        decodeNotificationCreated(nb)
+        val hb = hintBytes ?: return // no notification hint (avoids double-firing)
+        decodeNotificationOccurrencesChanged(hb)
     }
 
-    /** RealtimeNotificationCreatedEvent -> decision logic + hydration. */
-    private fun decodeNotificationCreated(data: ByteArray) {
+    /**
+     * NotificationOccurrencesChangedEvent: field 1 is the optional
+     * created_notification_id, present only when a notification was created
+     * for this user under their notification policies (absent for updates and
+     * removals). The hint carries no room/message, so the occurrence is
+     * fetched to learn what to alert about.
+     */
+    private fun decodeNotificationOccurrencesChanged(data: ByteArray) {
         val r = ProtoReader(data)
         var notificationId: String? = null
-        var roomId: String? = null
-        var eventId: String? = null
-        var silent = false
         while (r.hasMore()) {
             val field = r.nextField()
             when {
                 field == 1 && r.wireType == 2 -> notificationId = r.readString()
-                field == 2 && r.wireType == 2 -> roomId = r.readString()
-                field == 3 && r.wireType == 2 -> eventId = r.readString()
-                field == 5 && r.wireType == 0 -> silent = r.readVarintValue() != 0L
                 else -> r.skipValue()
             }
         }
+        val id = notificationId?.takeIf { it.isNotBlank() } ?: return
+        if (BuildConfig.DEBUG) Log.d(TAG, "notification created id=$id")
+        if (!getNotificationsEnabled()) return
+        fetchOccurrenceAndNotify(id)
+    }
 
-        if (silent) return                                    // no alert requested
-        val room = roomId?.takeIf { it.isNotBlank() } ?: return // nothing to open
-        if (room == activeRoomId) return                      // user already viewing it
+    // Occurrence resolution
 
-        val ev = eventId?.takeIf { it.isNotBlank() }
-        // Dedup by event_id (distinct per message) falling back to notification_id.
-        val dedupKey = ev ?: notificationId?.takeIf { it.isNotBlank() } ?: room
-        if (!shouldFire(dedupKey)) return
+    /** Fetch the notification occurrence, extract its room/message, alert. */
+    private fun fetchOccurrenceAndNotify(notificationId: String) {
+        val serverUrl = getServerUrl()
+        val cookies = getCookies(serverUrl) ?: return
 
-        fetchRoomEventAndNotify(room, ev)
+        val url = "$serverUrl/api/connect/chatto.api.v1.NotificationService/GetNotificationOccurrence"
+        val body = JSONObject().put("notificationId", notificationId)
+            .toString().toRequestBody("application/json".toMediaTypeOrNull())
+        val request = Request.Builder()
+            .url(url)
+            .header("Cookie", cookies)
+            .header("Content-Type", "application/json")
+            .post(body)
+            .build()
+
+        client?.newCall(request)?.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: java.io.IOException) {
+                if (BuildConfig.DEBUG) Log.w(TAG, "Occurrence fetch failed: ${e.message}")
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                try {
+                    val raw = response.body?.string() ?: "{}"
+                    if (response.code != 200) {
+                        if (BuildConfig.DEBUG) Log.w(TAG, "Occurrence fetch HTTP ${response.code}")
+                        return
+                    }
+                    handleOccurrence(JSONObject(raw), notificationId)
+                } catch (e: Exception) {
+                    if (BuildConfig.DEBUG) Log.w(TAG, "Failed to parse occurrence: ${e.message}")
+                }
+            }
+        })
+    }
+
+    /** Pull {room.id, eventId} out of the occurrence's typed signal. */
+    private fun handleOccurrence(json: JSONObject, notificationId: String) {
+        val occ = json.optJSONObject("occurrence") ?: return
+        val signal = occ.optJSONObject("signal") ?: return
+        // Every signal variant carries message = {room: {id}, eventId}.
+        var message: JSONObject? = null
+        val keys = signal.keys()
+        while (keys.hasNext()) {
+            val m = signal.optJSONObject(keys.next())?.optJSONObject("message")
+            if (m != null) {
+                message = m
+                break
+            }
+        }
+        val msg = message ?: return // not a message notification
+        val room = msg.optJSONObject("room")?.optString("id", "")?.takeIf { it.isNotBlank() } ?: return
+        if (room == activeRoomId) return // user already viewing it
+        val eventId = msg.optString("eventId", "").takeIf { it.isNotBlank() }
+        if (!shouldFire(notificationId)) return
+        fetchRoomEventAndNotify(room, eventId)
     }
 
     // Notification Deduplication

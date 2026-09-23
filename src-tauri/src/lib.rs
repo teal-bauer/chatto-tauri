@@ -112,7 +112,7 @@ const NOTIFICATION_BRIDGE_JS: &str = r#"
     }
     function __pbStr(buf, f) { return (f && f.wire === 2) ? __pbDecodeUtf8(buf, f.start, f.end) : null; }
 
-    // Decode a RealtimeServerFrame -> RealtimeEventEnvelope -> notification_created.
+    // Decode a RealtimeServerFrame -> RealtimeEvent -> notification hint.
     // serverOrigin is the http(s) origin of the socket this frame arrived on
     // (see __chattoWsHttpOrigin below), threaded through so hydration hits the
     // right server, not always the origin host.
@@ -120,25 +120,72 @@ const NOTIFICATION_BRIDGE_JS: &str = r#"
         // On Android the native NotificationService owns the background path;
         // firing here too would double up.
         if (window.ChattoAndroid) return;
-        // RealtimeServerFrame.event = field 3 (LEN).
-        var evt = __pbField(buf, 0, buf.length, 3);
+        // RealtimeServerFrame frame oneof: event=1, heartbeat=2, close=3,
+        // caught_up=4, snapshot=5. Only the event (1, LEN) matters here.
+        var evt = __pbField(buf, 0, buf.length, 1);
         if (!evt || evt.wire !== 2) return;
-        // RealtimeEventEnvelope.notification_created = field 60 (LEN). Key on this only.
-        var notif = __pbField(buf, evt.start, evt.end, 60);
-        if (!notif || notif.wire !== 2) return;
-        // RealtimeNotificationCreatedEvent fields.
-        var notifId = __pbStr(buf, __pbField(buf, notif.start, notif.end, 1));
-        var roomId  = __pbStr(buf, __pbField(buf, notif.start, notif.end, 2));
-        var eventId = __pbStr(buf, __pbField(buf, notif.start, notif.end, 3));
-        var silentF = __pbField(buf, notif.start, notif.end, 5);
-        if (silentF && silentF.wire === 0 && silentF.value !== 0) return; // silent
-        if (!roomId) return;
+        // RealtimeEvent.notification_occurrences_changed = field 56 (LEN):
+        // sent when a notification was created for this user under their
+        // notification policies. Field 57 is the room-unread hint, not an
+        // alert.
+        var hint = __pbField(buf, evt.start, evt.end, 56);
+        if (!hint || hint.wire !== 2) return;
+        // NotificationOccurrencesChangedEvent.created_notification_id =
+        // field 1 (optional string; absent for updates and removals).
+        var notifId = __pbStr(buf, __pbField(buf, hint.start, hint.end, 1));
+        if (!notifId) return;
         if (!window.__chattoWindowHidden) return;
-        // Fold the server origin into the dedup key so the same event id from
-        // two different servers can't wrongly dedupe each other.
-        var key = (serverOrigin || '') + '|' + (eventId || notifId || roomId);
+        // Fold the server origin into the dedup key so the same notification
+        // id from two different servers can't wrongly dedupe each other.
+        var key = (serverOrigin || '') + '|' + notifId;
         if (!__chattoShouldFire(key)) return;
-        __chattoFetchEventAndNotify(roomId, eventId, serverOrigin);
+        __chattoFetchOccurrenceAndNotify(notifId, serverOrigin);
+    }
+
+    // The notification hint carries only the occurrence's ID; fetch the
+    // occurrence to learn which room/message it is about, skip the room
+    // already open in this window, then hydrate the message body as usual.
+    // Same-origin fetches use cookies; a remote server uses its own bearer
+    // token from the instance registry -- same rules as hydration below.
+    function __chattoFetchOccurrenceAndNotify(notificationId, serverOrigin) {
+        if (!window.__TAURI_INTERNALS__) return;
+        var base = serverOrigin || window.location.origin;
+        var isOrigin = base === window.location.origin;
+        var token = isOrigin ? null : __chattoTokenForOrigin(base);
+        if (!isOrigin && !token) return;
+
+        var headers = {'Content-Type': 'application/json'};
+        var fetchOpts = {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify({ notificationId: notificationId })
+        };
+        if (isOrigin) {
+            fetchOpts.credentials = 'include';
+        } else {
+            headers['Authorization'] = 'Bearer ' + token;
+        }
+
+        fetch(base + '/api/connect/chatto.api.v1.NotificationService/GetNotificationOccurrence', fetchOpts)
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            var occ = data && data.occurrence;
+            if (!occ) return;
+            // Every signal variant carries message = {room: {id}, eventId}.
+            var ref = null;
+            var sig = occ.signal || {};
+            for (var k in sig) {
+                if (sig[k] && sig[k].message) { ref = sig[k].message; break; }
+            }
+            var roomId = ref && ref.room && ref.room.id;
+            if (!roomId) return; // not a message notification
+            // Don't alert for the room already open in this window.
+            var m = window.location.pathname.match(/^\/chat\/(?:[^\/]+\/)?([^\/?#]+)/);
+            if (m && m[1] === roomId) return;
+            var actorName = (occ.actor && occ.actor.displayName) || null;
+            __chattoFetchEventAndNotify(roomId, ref.eventId || null, base, actorName);
+        })
+        .catch(function() {});
     }
 
     // Derives the http(s) origin of a WebSocket URL, e.g.
@@ -177,8 +224,9 @@ const NOTIFICATION_BRIDGE_JS: &str = r#"
     // otherwise. serverOrigin is the origin the notification frame arrived
     // from (see __chattoWsHttpOrigin): the origin server hydrates via
     // same-origin ConnectRPC with cookies (unchanged); a remote server
-    // hydrates via an absolute URL with its own bearer token.
-    function __chattoFetchEventAndNotify(roomId, eventId, serverOrigin) {
+    // hydrates via an absolute URL with its own bearer token. titleHint is
+    // the notification occurrence's actor display name when known.
+    function __chattoFetchEventAndNotify(roomId, eventId, serverOrigin, titleHint) {
         if (!window.__TAURI_INTERNALS__) return;
         var path, body;
         if (eventId) {
@@ -221,9 +269,10 @@ const NOTIFICATION_BRIDGE_JS: &str = r#"
                 for (var i = 0; i < events.length; i++) {
                     if (events[i] && events[i].id === eventId) { anchor = events[i]; break; }
                 }
-                if (!anchor && typeof page.targetIndex === 'number'
-                    && page.targetIndex >= 0 && page.targetIndex < events.length) {
-                    var t = events[page.targetIndex];
+                // GetRoomEventsAroundResponse.targetIndex sits beside `page`.
+                if (!anchor && typeof data.targetIndex === 'number'
+                    && data.targetIndex >= 0 && data.targetIndex < events.length) {
+                    var t = events[data.targetIndex];
                     if (t && t.messagePosted) anchor = t;
                 }
             }
@@ -238,7 +287,9 @@ const NOTIFICATION_BRIDGE_JS: &str = r#"
             var actorId = (msg && msg.actorId) || (anchor && anchor.actorId);
             var title = 'Chatto';
             var users = page.includes && page.includes.users;
-            if (users && actorId && users[actorId] && users[actorId].displayName) {
+            if (titleHint) {
+                title = titleHint;
+            } else if (users && actorId && users[actorId] && users[actorId].displayName) {
                 title = users[actorId].displayName;
             }
             window.__TAURI_INTERNALS__.invoke('show_notification', {
@@ -611,6 +662,20 @@ const EXTERNAL_LINK_JS: &str = r#"
     if (window.__chattoExternalLinks) return;
     window.__chattoExternalLinks = true;
 
+    // Main-window OAuth fallback (see the window.open shim below): the
+    // provider callback lands in this window after the flow completed here,
+    // with no opener or BroadcastChannel listener left to receive a popup
+    // handoff. The provider session cookie is already established, so finish
+    // by reloading the app root, whose session state picks the new session
+    // up. Delayed so a real popup (if the platform ever opens one) gets to
+    // deliver its handoff first; by then it has normally closed itself.
+    try {
+        var cbUrl = new URL(window.location.href);
+        if (cbUrl.pathname === '/servers/callback' && cbUrl.searchParams.get('mode') === 'provider') {
+            window.setTimeout(function() { window.location.replace(cbUrl.origin + '/'); }, 3000);
+        }
+    } catch (e) {}
+
     var serverHost = window.location.hostname;
     // Updated by check_instance_flow on page load. While true, the page is on a
     // FOREIGN host (an OIDC provider mid-flow), keep every link inside the
@@ -653,6 +718,34 @@ const EXTERNAL_LINK_JS: &str = r#"
 
         var origOpen = window.open;
         window.open = function(url) {
+            // OAuth sign-in opens an about:blank popup with popup window
+            // features, then navigates it. This webview denies secondary
+            // windows (wry returns null), so that flow could never open.
+            // Return a location shim instead: its setter runs the flow in
+            // THIS window, using the callback page's legacy full-page path --
+            // which only activates when redirect_uri carries no `mode=popup`,
+            // so strip that before navigating.
+            if (url === 'about:blank' && typeof arguments[2] === 'string' &&
+                    arguments[2].indexOf('popup') !== -1) {
+                var oauthLocation = { _href: '' };
+                Object.defineProperty(oauthLocation, 'href', {
+                    get: function() { return this._href; },
+                    set: function(v) {
+                        this._href = String(v)
+                            .replace(/%3Fmode%3Dpopup/g, '')
+                            .replace(/([?&])mode=popup&/g, '$1')
+                            .replace(/[?&]mode=popup$/, '');
+                        window.location.href = this._href;
+                    }
+                });
+                return {
+                    closed: false,
+                    opener: null,
+                    focus: function() {},
+                    close: function() {},
+                    location: oauthLocation
+                };
+            }
             if (url && shouldExternalize(url)) {
                 openExternal(url);
                 return null;
@@ -736,6 +829,12 @@ fn set_server_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
     store.set("server_url", json!(url));
     store.save().map_err(|e| e.to_string())?;
 
+    // Keep check_instance_flow's foreign-host detection aligned with the
+    // configured origin after an instance switch.
+    if let Ok(mut guard) = CONFIGURED_ORIGIN_HOST.lock() {
+        *guard = parsed.host_str().map(String::from);
+    }
+
     let window = app.get_webview_window("main").ok_or("no main window")?;
     window.navigate(parsed).map_err(|e| e.to_string())
 }
@@ -748,6 +847,9 @@ fn clear_server_url(app: tauri::AppHandle) -> Result<(), String> {
 
     let window = app.get_webview_window("main").ok_or("no main window")?;
     let default_url: tauri::Url = DEFAULT_SERVER_URL.parse().expect("invalid DEFAULT_SERVER_URL");
+    if let Ok(mut guard) = CONFIGURED_ORIGIN_HOST.lock() {
+        *guard = default_url.host_str().map(String::from);
+    }
     window.navigate(default_url).map_err(|e| e.to_string())
 }
 
