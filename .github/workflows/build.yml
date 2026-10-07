@@ -102,6 +102,9 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install
 
+      - name: Test webview bridges
+        run: pnpm test
+
       - name: Stage Apple API key (macOS)
         if: matrix.platform == 'macos-latest'
         env:

@@ -704,6 +704,86 @@ const EXTERNAL_LINK_JS: &str = r#"
         }
     }
 
+    // Chatto publishes each popup's target in a same-origin launch record.
+    function authorizationLaunchKey(value) {
+        try {
+            var url = new URL(value, window.location.href);
+            if (url.origin === window.location.origin &&
+                    url.pathname === '/servers/authorize' && !url.search && url.hash.length > 1) {
+                return 'chatto:oauth-launch:' + url.hash.slice(1);
+            }
+        } catch (_) {}
+        return null;
+    }
+
+    // Keep the PKCE flow's sessionStorage in this webview. The callback without
+    // mode=popup exchanges the code here instead of messaging an absent opener.
+    function mainWindowAuthorization(launchKey) {
+        var poll = null;
+        var deadline = Date.now() + 5 * 60 * 1000;
+        var popup = { closed: false, opener: null, focus: function() {} };
+        function cleanup() {
+            if (poll !== null) window.clearInterval(poll);
+            poll = null;
+            if (launchKey) {
+                try { window.localStorage.removeItem(launchKey); } catch (_) {}
+            }
+        }
+        popup.close = function() {
+            popup.closed = true;
+            cleanup();
+        };
+        var href = '';
+        function navigate(value) {
+            var target = new URL(value, window.location.href);
+            if (target.protocol !== 'https:' && target.protocol !== 'http:') {
+                throw new Error('Unsupported authorization URL.');
+            }
+            var redirect = target.searchParams.get('redirect_uri');
+            if (redirect) {
+                var callback = new URL(redirect);
+                if (callback.origin === window.location.origin &&
+                        callback.pathname === '/servers/callback' &&
+                        callback.searchParams.get('mode') === 'popup') {
+                    callback.searchParams.delete('mode');
+                    target.searchParams.set('redirect_uri', callback.href);
+                }
+            }
+            href = target.href;
+            cleanup();
+            window.location.replace(href);
+        }
+        popup.location = { replace: navigate };
+        Object.defineProperty(popup.location, 'href', {
+            get: function() { return href; },
+            set: navigate
+        });
+        if (launchKey) {
+            poll = window.setInterval(function() {
+                if (Date.now() > deadline) {
+                    popup.close();
+                    return;
+                }
+                var raw;
+                try { raw = window.localStorage.getItem(launchKey); }
+                catch (_) { return; } // A storage failure uses location.replace.
+                if (raw === null) return;
+                try {
+                    var record = JSON.parse(raw);
+                    if (!record || typeof record.url !== 'string' ||
+                            typeof record.createdAt !== 'number' || !isFinite(record.createdAt) ||
+                            Date.now() - record.createdAt > 5 * 60 * 1000) {
+                        throw new Error('Invalid authorization launch record.');
+                    }
+                    navigate(record.url);
+                } catch (_) {
+                    popup.close();
+                }
+            }, 50);
+        }
+        return popup;
+    }
+
     function installHandlers() {
         document.addEventListener('click', function(e) {
             var a = e.target.closest('a[href]');
@@ -718,33 +798,12 @@ const EXTERNAL_LINK_JS: &str = r#"
 
         var origOpen = window.open;
         window.open = function(url) {
-            // OAuth sign-in opens an about:blank popup with popup window
-            // features, then navigates it. This webview denies secondary
-            // windows (wry returns null), so that flow could never open.
-            // Return a location shim instead: its setter runs the flow in
-            // THIS window, using the callback page's legacy full-page path --
-            // which only activates when redirect_uri carries no `mode=popup`,
-            // so strip that before navigating.
-            if (url === 'about:blank' && typeof arguments[2] === 'string' &&
+            // Tauri does not open browser popups. Support both Chatto's launch
+            // page and about:blank, then run authorization in this webview.
+            var launchKey = authorizationLaunchKey(url);
+            if ((url === 'about:blank' || launchKey) && typeof arguments[2] === 'string' &&
                     arguments[2].indexOf('popup') !== -1) {
-                var oauthLocation = { _href: '' };
-                Object.defineProperty(oauthLocation, 'href', {
-                    get: function() { return this._href; },
-                    set: function(v) {
-                        this._href = String(v)
-                            .replace(/%3Fmode%3Dpopup/g, '')
-                            .replace(/([?&])mode=popup&/g, '$1')
-                            .replace(/[?&]mode=popup$/, '');
-                        window.location.href = this._href;
-                    }
-                });
-                return {
-                    closed: false,
-                    opener: null,
-                    focus: function() {},
-                    close: function() {},
-                    location: oauthLocation
-                };
+                return mainWindowAuthorization(launchKey);
             }
             if (url && shouldExternalize(url)) {
                 openExternal(url);
