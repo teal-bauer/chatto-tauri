@@ -662,6 +662,79 @@ const EXTERNAL_LINK_JS: &str = r#"
     if (window.__chattoExternalLinks) return;
     window.__chattoExternalLinks = true;
 
+    var oauthReturnKey = 'chatto:tauri:oauth-return:v1';
+    var oauthFlowKey = 'chatto:oauth:flow';
+    var oauthReturnTTL = 5 * 60 * 1000;
+
+    // The web frontend owns code exchange and session registration. Run its
+    // full-page callback locally, but keep the registered redirect URI on the
+    // wire in both the authorize request and the one matching token request.
+    function resumeMainWindowAuthorization() {
+        try {
+            var callback = new URL(window.location.href);
+            if (callback.pathname !== '/servers/callback' ||
+                    callback.searchParams.get('mode') !== 'popup') return;
+            var raw = window.sessionStorage.getItem(oauthReturnKey);
+            window.sessionStorage.removeItem(oauthReturnKey);
+            if (!raw) return;
+            var record = JSON.parse(raw);
+            var flow = JSON.parse(window.sessionStorage.getItem(oauthFlowKey));
+            var code = callback.searchParams.get('code');
+            var error = callback.searchParams.get('error');
+            if (!record || !flow || typeof record.createdAt !== 'number' ||
+                    !isFinite(record.createdAt) || record.createdAt > Date.now() ||
+                    Date.now() - record.createdAt > oauthReturnTTL ||
+                    typeof record.redirectUri !== 'string' ||
+                    typeof flow.state !== 'string' || !flow.state ||
+                    record.state !== flow.state || record.clientId !== flow.clientId ||
+                    record.remoteUrl !== flow.remoteUrl ||
+                    callback.searchParams.getAll('state').length !== 1 ||
+                    callback.searchParams.get('state') !== flow.state ||
+                    callback.searchParams.getAll('mode').length !== 1 ||
+                    callback.searchParams.getAll('code').length > 1 ||
+                    callback.searchParams.getAll('error').length > 1 ||
+                    (!code && !error) || (code && error)) return;
+            var redirect = new URL(record.redirectUri);
+            if (redirect.origin !== callback.origin || redirect.pathname !== callback.pathname ||
+                    redirect.searchParams.get('mode') !== 'popup' || redirect.hash ||
+                    redirect.username || redirect.password) return;
+            if (typeof flow.remoteUrl !== 'string' || typeof flow.clientId !== 'string' ||
+                    typeof flow.verifier !== 'string' || !flow.verifier) return;
+            var tokenUrl = new URL(flow.remoteUrl + '/oauth/token');
+            if (tokenUrl.protocol !== 'https:' && tokenUrl.protocol !== 'http:') return;
+            var fullPageRedirect = callback.origin + callback.pathname;
+            callback.searchParams.delete('mode');
+            window.history.replaceState(window.history.state, '', callback.href);
+            if (!code) return;
+            var originalFetch = window.fetch;
+            var pendingExchange = true;
+            function restoreFetch() {
+                pendingExchange = false;
+                if (window.fetch === exchangeFetch) window.fetch = originalFetch;
+                flow = record = code = null;
+            }
+            var exchangeFetch = function(input, init) {
+                if (pendingExchange && input === flow.remoteUrl + '/oauth/token' &&
+                        init && init.method === 'POST' && typeof init.body === 'string') {
+                    var body;
+                    try { body = JSON.parse(init.body); } catch (_) {}
+                    if (body && body.grant_type === 'authorization_code' && body.code === code &&
+                            body.client_id === flow.clientId && body.code_verifier === flow.verifier &&
+                            body.redirect_uri === fullPageRedirect) {
+                        body.redirect_uri = record.redirectUri;
+                        init = Object.assign({}, init, { body: JSON.stringify(body) });
+                        window.clearTimeout(restoreTimer);
+                        restoreFetch();
+                    }
+                }
+                return originalFetch.call(window, input, init);
+            };
+            window.fetch = exchangeFetch;
+            var restoreTimer = window.setTimeout(restoreFetch, oauthReturnTTL);
+        } catch (_) {}
+    }
+    resumeMainWindowAuthorization();
+
     // Main-window OAuth fallback (see the window.open shim below): the
     // provider callback lands in this window after the flow completed here,
     // with no opener or BroadcastChannel listener left to receive a popup
@@ -716,8 +789,8 @@ const EXTERNAL_LINK_JS: &str = r#"
         return null;
     }
 
-    // Keep the PKCE flow's sessionStorage in this webview. The callback without
-    // mode=popup exchanges the code here instead of messaging an absent opener.
+    // Keep the PKCE flow's sessionStorage in this webview. Record the exact
+    // registered redirect so the callback can use the frontend's full-page path.
     function mainWindowAuthorization(launchKey) {
         var poll = null;
         var deadline = Date.now() + 5 * 60 * 1000;
@@ -745,8 +818,23 @@ const EXTERNAL_LINK_JS: &str = r#"
                 if (callback.origin === window.location.origin &&
                         callback.pathname === '/servers/callback' &&
                         callback.searchParams.get('mode') === 'popup') {
-                    callback.searchParams.delete('mode');
-                    target.searchParams.set('redirect_uri', callback.href);
+                    var flow = JSON.parse(window.sessionStorage.getItem(oauthFlowKey));
+                    if (!flow || flow.state !== target.searchParams.get('state') ||
+                            flow.clientId !== target.searchParams.get('client_id') ||
+                            new URL(flow.remoteUrl).origin !== target.origin) {
+                        throw new Error('Invalid authorization flow.');
+                    }
+                    var record = JSON.stringify({
+                        state: flow.state,
+                        clientId: flow.clientId,
+                        remoteUrl: flow.remoteUrl,
+                        redirectUri: redirect,
+                        createdAt: Date.now()
+                    });
+                    window.sessionStorage.setItem(oauthReturnKey, record);
+                    if (window.sessionStorage.getItem(oauthReturnKey) !== record) {
+                        throw new Error('Authorization return state could not be saved.');
+                    }
                 }
             }
             href = target.href;

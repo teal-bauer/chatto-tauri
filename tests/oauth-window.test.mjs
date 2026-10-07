@@ -13,27 +13,71 @@ const script = rust.match(
 )?.[1];
 assert.ok(script);
 
-function harness({ storageUnavailable = false, native = false } = {}) {
+const flowKey = "chatto:oauth:flow";
+const returnKey = "chatto:tauri:oauth-return:v1";
+const popupRedirect = "https://origin.example/servers/callback?mode=popup";
+
+function savedFlow() {
+  return {
+    state: "csrf-state",
+    verifier: "pkce-verifier",
+    clientId: "https://origin.example/oauth/frontend-client-metadata.json",
+    remoteUrl: "https://remote.example",
+  };
+}
+
+function harness({
+  storageUnavailable = false,
+  native = false,
+  url = "https://origin.example/chat/remote/room",
+  sessionRecords = new Map([[flowKey, JSON.stringify(savedFlow())]]),
+  fetchImpl = async () => new Response(null, { status: 200 }),
+} = {}) {
   const records = new Map();
   const intervals = new Map();
+  const timeouts = new Map();
   const navigations = [];
   const opened = [];
   const invocations = [];
   let timerId = 0;
   let now = 1_000_000;
+  let currentUrl = new URL(url);
+  const requests = [];
+  const historyChanges = [];
   const location = {
     get href() {
-      return "https://origin.example/chat/remote/room";
+      return currentUrl.href;
     },
     set href(url) {
       navigations.push(url);
     },
-    origin: "https://origin.example",
-    hostname: "origin.example",
+    get origin() {
+      return currentUrl.origin;
+    },
+    get hostname() {
+      return currentUrl.hostname;
+    },
     replace: (url) => navigations.push(url),
   };
   const window = {
     location,
+    history: {
+      state: null,
+      replaceState: (state, _title, target) => {
+        window.history.state = state;
+        currentUrl = new URL(target, currentUrl);
+        historyChanges.push(currentUrl.href);
+      },
+    },
+    sessionStorage: {
+      getItem: (key) => sessionRecords.get(key) ?? null,
+      setItem: (key, value) => sessionRecords.set(key, value),
+      removeItem: (key) => sessionRecords.delete(key),
+    },
+    fetch: (input, init) => {
+      requests.push({ input, init });
+      return fetchImpl(input, init);
+    },
     open: (...args) => {
       opened.push(args);
       return null;
@@ -43,7 +87,11 @@ function harness({ storageUnavailable = false, native = false } = {}) {
       return timerId;
     },
     clearInterval: (id) => intervals.delete(id),
-    setTimeout: () => ++timerId,
+    setTimeout: (callback) => {
+      timeouts.set(++timerId, callback);
+      return timerId;
+    },
+    clearTimeout: (id) => timeouts.delete(id),
     localStorage: {
       getItem: (key) => {
         if (storageUnavailable) throw new Error("Storage unavailable");
@@ -70,9 +118,13 @@ function harness({ storageUnavailable = false, native = false } = {}) {
     window,
     records,
     intervals,
+    timeouts,
     navigations,
     opened,
     invocations,
+    requests,
+    historyChanges,
+    sessionRecords,
     poll: () => [...intervals.values()].forEach((callback) => callback()),
     advance: (ms) => {
       now += ms;
@@ -115,10 +167,7 @@ test("launch-page sign-in returns a window and follows its storage record in the
   assert.equal(h.navigations.length, 1);
   const target = new URL(h.navigations[0]);
   assert.equal(target.origin, "https://remote.example");
-  assert.equal(
-    target.searchParams.get("redirect_uri"),
-    "https://origin.example/servers/callback",
-  );
+  assert.equal(target.searchParams.get("redirect_uri"), popupRedirect);
   assert.equal(target.searchParams.get("state"), "csrf-state");
   assert.equal(target.searchParams.get("code_challenge"), "pkce-challenge");
   assert.equal(
@@ -138,10 +187,7 @@ test("storage fallback supports location.replace without changing unrelated quer
   popup.location.replace(target.href);
   const navigated = new URL(h.navigations[0]);
   assert.equal(navigated.searchParams.get("other"), "literal?mode=popup");
-  assert.equal(
-    navigated.searchParams.get("redirect_uri"),
-    "https://origin.example/servers/callback",
-  );
+  assert.equal(navigated.searchParams.get("redirect_uri"), popupRedirect);
   assert.equal(h.intervals.size, 0);
 });
 
@@ -152,8 +198,218 @@ test("about:blank flows support assignment to location.href", () => {
   popup.location.href = authorizationUrl();
   assert.equal(
     new URL(h.navigations[0]).searchParams.get("redirect_uri"),
-    "https://origin.example/servers/callback",
+    popupRedirect,
   );
+});
+
+function returnedFlow(options = {}) {
+  const opening = harness();
+  opening.window
+    .open(launch, "chatto-oauth-state", "popup")
+    .location.replace(authorizationUrl());
+  const callback = harness({
+    url: popupRedirect + "&code=issued-code&state=csrf-state",
+    sessionRecords: opening.sessionRecords,
+    ...options,
+  });
+  return { opening, callback };
+}
+
+function exchangeBody(extra = {}) {
+  return {
+    grant_type: "authorization_code",
+    code: "issued-code",
+    code_verifier: savedFlow().verifier,
+    client_id: savedFlow().clientId,
+    redirect_uri: "https://origin.example/servers/callback",
+    ...extra,
+  };
+}
+
+test("authorization and code exchange use the same exact registered redirect", async () => {
+  const registeredRedirects = [popupRedirect];
+  const { opening, callback } = returnedFlow({
+    fetchImpl: async (_input, init) => {
+      const body = JSON.parse(init.body);
+      return Response.json(
+        registeredRedirects.includes(body.redirect_uri)
+          ? {
+              access_token: "fixture-access-token",
+              refresh_token: "fixture-refresh-token",
+            }
+          : {
+              error: "invalid_request",
+              error_description:
+                "redirect_uri is not registered for this client",
+            },
+        { status: registeredRedirects.includes(body.redirect_uri) ? 200 : 400 },
+      );
+    },
+  });
+  const authorizedRedirect = new URL(opening.navigations[0]).searchParams.get(
+    "redirect_uri",
+  );
+  assert.ok(registeredRedirects.includes(authorizedRedirect));
+  assert.equal(
+    new URL(callback.window.location.href).searchParams.has("mode"),
+    false,
+  );
+  assert.equal(
+    new URL(callback.window.location.href).searchParams.get("code"),
+    "issued-code",
+  );
+  assert.equal(callback.sessionRecords.has(returnKey), false);
+
+  // The frontend consumes its PKCE state before calling the token endpoint.
+  const flow = JSON.parse(callback.sessionRecords.get(flowKey));
+  callback.sessionRecords.delete(flowKey);
+  const signal = new AbortController().signal;
+  const headers = { "Content-Type": "application/json" };
+  const response = await callback.window.fetch(
+    flow.remoteUrl + "/oauth/token",
+    {
+      method: "POST",
+      headers,
+      signal,
+      body: JSON.stringify(exchangeBody()),
+    },
+  );
+  assert.equal(response.status, 200);
+  assert.equal(
+    JSON.parse(callback.requests[0].init.body).redirect_uri,
+    authorizedRedirect,
+  );
+  assert.equal(callback.requests[0].init.headers, headers);
+  assert.equal(callback.requests[0].init.signal, signal);
+  assert.equal((await response.json()).access_token, "fixture-access-token");
+});
+
+test("the callback adapter affects only one matching authorization-code exchange", async () => {
+  const { callback } = returnedFlow();
+  const original = callback.window.fetch;
+  for (const [input, body] of [
+    ["https://other.example/oauth/token", exchangeBody()],
+    [
+      "https://remote.example/oauth/token",
+      exchangeBody({ grant_type: "refresh_token" }),
+    ],
+    [
+      "https://remote.example/oauth/token",
+      exchangeBody({ client_id: "other-client" }),
+    ],
+    [
+      "https://remote.example/oauth/token",
+      exchangeBody({ code_verifier: "other-verifier" }),
+    ],
+    [
+      "https://remote.example/oauth/token",
+      exchangeBody({ code: "other-code" }),
+    ],
+    [
+      "https://remote.example/oauth/token",
+      exchangeBody({ redirect_uri: "https://other.example/servers/callback" }),
+    ],
+  ]) {
+    const init = { method: "POST", body: JSON.stringify(body) };
+    await callback.window.fetch(input, init);
+    assert.equal(callback.requests.at(-1).init, init);
+    assert.equal(callback.window.fetch, original);
+  }
+  await callback.window.fetch("https://remote.example/oauth/token", {
+    method: "POST",
+    body: JSON.stringify(exchangeBody()),
+  });
+  assert.notEqual(callback.window.fetch, original);
+  const second = { method: "POST", body: JSON.stringify(exchangeBody()) };
+  await callback.window.fetch("https://remote.example/oauth/token", second);
+  assert.equal(callback.requests.at(-1).init, second);
+});
+
+for (const [name, query] of [
+  ["wrong state", "mode=popup&code=issued-code&state=other-state"],
+  [
+    "duplicate state",
+    "mode=popup&code=issued-code&state=csrf-state&state=csrf-state",
+  ],
+  [
+    "duplicate code",
+    "mode=popup&code=issued-code&code=another-code&state=csrf-state",
+  ],
+  [
+    "code with error",
+    "mode=popup&code=issued-code&error=access_denied&state=csrf-state",
+  ],
+]) {
+  test(`does not adapt a callback with ${name}`, () => {
+    const { callback } = returnedFlow({
+      url: "https://origin.example/servers/callback?" + query,
+    });
+    assert.equal(callback.historyChanges.length, 0);
+    assert.equal(callback.sessionRecords.has(returnKey), false);
+    assert.equal(callback.sessionRecords.has(flowKey), true);
+  });
+}
+
+test("does not adapt a callback without a recorded main-window flow", () => {
+  const callback = harness({
+    url: popupRedirect + "&code=issued-code&state=csrf-state",
+  });
+  assert.equal(callback.historyChanges.length, 0);
+});
+
+test("does not adapt an expired or altered return record", () => {
+  for (const patch of [
+    { createdAt: 0 },
+    { clientId: "other-client" },
+    { remoteUrl: "https://other.example" },
+    { redirectUri: "https://other.example/servers/callback?mode=popup" },
+  ]) {
+    const opening = harness();
+    opening.window
+      .open(launch, "chatto-oauth-state", "popup")
+      .location.replace(authorizationUrl());
+    const record = JSON.parse(opening.sessionRecords.get(returnKey));
+    opening.sessionRecords.set(
+      returnKey,
+      JSON.stringify({ ...record, ...patch }),
+    );
+    const callback = harness({
+      url: popupRedirect + "&code=issued-code&state=csrf-state",
+      sessionRecords: opening.sessionRecords,
+    });
+    assert.equal(callback.historyChanges.length, 0);
+  }
+});
+
+test("an unused callback exchange adapter expires", async () => {
+  const { callback } = returnedFlow();
+  const adapted = callback.window.fetch;
+  for (const expire of callback.timeouts.values()) expire();
+  assert.notEqual(callback.window.fetch, adapted);
+  const init = { method: "POST", body: JSON.stringify(exchangeBody()) };
+  await callback.window.fetch("https://remote.example/oauth/token", init);
+  assert.equal(callback.requests[0].init, init);
+});
+
+test("an authorization denial uses the full-page error path without an exchange adapter", () => {
+  const { callback } = returnedFlow({
+    url: popupRedirect + "&error=access_denied&state=csrf-state",
+  });
+  const url = new URL(callback.window.location.href);
+  assert.equal(url.searchParams.has("mode"), false);
+  assert.equal(url.searchParams.get("error"), "access_denied");
+  assert.equal(callback.requests.length, 0);
+});
+
+test("sign-in cannot navigate when its return record cannot be persisted", () => {
+  const opening = harness();
+  opening.window.sessionStorage.setItem = () => {};
+  const popup = opening.window.open(launch, "chatto-oauth-state", "popup");
+  assert.throws(
+    () => popup.location.replace(authorizationUrl()),
+    /could not be saved/,
+  );
+  assert.equal(opening.navigations.length, 0);
 });
 
 test("close cancels a pending launch and removes its record", () => {
