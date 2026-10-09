@@ -1,0 +1,12 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "run.chatto.twa",
+      "sha256_cert_fingerprints": [
+        "REPLACE_WITH_YOUR_APK_SIGNING_CERT_SHA256"
+      ]
+    }
+  }
+]
