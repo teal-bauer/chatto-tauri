@@ -358,6 +358,15 @@ const NOTIFICATION_BRIDGE_JS: &str = r#"
     window.Notification.requestPermission = function() {
         return Promise.resolve('granted');
     };
+
+    // The webview has no push service behind PushManager, so a Web Push
+    // subscription can only fail, and the real notification permission the
+    // engine checks is never granted. Without the constructor the web app
+    // reports push as unsupported instead of showing a failed setup, and
+    // notifications keep arriving through the native path above.
+    try {
+        delete window.PushManager;
+    } catch(_) {}
 })();
 "#;
 
